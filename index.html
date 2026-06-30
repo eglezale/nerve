@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#f2efe9">
-<title>Negative Space</title>
+<title>Nerve</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body {
@@ -133,10 +133,19 @@ grain.width = grain.height = 180;
 const grainPattern = ctx.createPattern(grain, 'repeat');
 
 // ─── State ───────────────────────────────────────────────────────────────────
-let state = 'intro';                                  // intro | playing | over
-let score = 0;
-let highScore = +localStorage.getItem('ns_hi_pct') || 0;
+let state = 'intro';                                  // intro | playing | over | won
+let highScore = +localStorage.getItem('ns_nerve') || 0; // best NERVE
 let elapsed = 0;
+
+// ─── Risk–reward: NERVE is the score, earned only by grazing danger ──────────--
+// graze = proximity to nearest ink (0 far → 1 touching); it drives a multiplier
+// and the rate you bank NERVE. Hugging the ink is where the points are.
+let nerve = 0, mult = 1, graze = 0;
+const DANGER_BAND = 82, MAX_MULT = 5;
+const motes = [];          // collectible glints that sit in the risky gaps
+let moteTimer = 0, collected = 0, moteSpawnCount = 0, reachTimer = 0;
+const MOTE_MSGS = ['COLLECT ME', 'CATCH ME', 'OVER HERE', 'GRAB ME'];
+const floats = [];         // rising "+NERVE" popups that teach the scoring
 
 // ─── Player ──────────────────────────────────────────────────────────────────
 const PLAYER_R = 5;
@@ -145,7 +154,12 @@ let pulse = 0;
 
 // ─── Shapes ────────────────────────────────────────────────────────────────--
 const shapes = [];
-let spawnTimer = 0, ambushTimer = 0, nextSpawn = 600, stillTime = 0;
+let spawnTimer = 0, ambushTimer = 0, nextSpawn = 600;
+// camp detection: how long the player has lingered within CAMP_R of an anchor.
+// Must sit a good while (CAMP_FULL) before ink forms under you, with a visible
+// warning over the last CAMP_WARN ms so it's never a surprise.
+let campX = 0, campY = 0, campTime = 0;
+const CAMP_R = 115, CAMP_FULL = 3000, CAMP_WARN = 1400;
 
 // When this fraction of the screen is occupied by ink, the void is "full" → WIN.
 // Score is your progress toward it (0–100%), measured precisely from real coverage.
@@ -252,17 +266,22 @@ function playWin() {
   bloomNote(1318, 0.55, 1.0, 0.03);      // high sparkle
 }
 
+// MOTE pickup — a bright little chime, same bloom family, pitched up.
+const playMote = () => { bloomNote(1175, 0, 0.3, 0.05); bloomNote(1568, 0.02, 0.28, 0.03); };
+
 // ─── Difficulty ───────────────────────────────────────────────────────────────
 function difficulty() {
   const t = elapsed / 1000;
-  const p = Math.min(1, t / 90);
+  // gentle opening: a calm ~7s warm-up, then a slow ramp toward full intensity
+  const p = Math.min(1, Math.max(0, (t - 7) / 115));
   const ease = p * p * (3 - 2 * p);
   return {
-    spawnInterval:  1200 - ease * 700,
-    shapeSpeed:     0.32 + ease * 0.80,
-    maxDimBase:     130  + ease * 220,
-    ambushChance:   Math.max(0, (t - 3) / 12),
-    ambushInterval: Math.max(1800, 5000 - ease * 3200),
+    spawnInterval:  1750 - ease * 1200,         // 1750 → 550 ms
+    shapeSpeed:     0.20 + ease * 0.88,          // slow-growing at first
+    maxDimBase:     105  + ease * 235,           // smaller blobs early
+    ambushChance:   Math.max(0, (t - 14) / 22),  // near-player ambushes only from ~14s
+    ambushInterval: Math.max(2000, 6500 - ease * 4400),
+    burst:          ease * 0.26,                 // multi-spawn bursts only once ramped
   };
 }
 
@@ -326,11 +345,100 @@ function spawnAmbush() {
   spawnNear(maxDim, maxDim / aspect, 30, 55, true);
 }
 
-// Anti-camp flush — ink blooms close beside a stationary player, forcing a move
-function spawnFlush() {
-  const maxDim = 70 + Math.random() * 70;
-  const aspect = 0.7 + Math.random() * 0.7;
-  spawnNear(maxDim, maxDim / aspect, 24, 38, true);
+// Anti-camp — when the player camps (e.g. a corner), ink nucleates RIGHT UNDER
+// the cursor from nothing and grows. This is the only case a blob spawns on you;
+// it gives a beat to flee, but standing still here is lethal, never a winning hide.
+function spawnUnderCursor() {
+  const maxDim = 95 + Math.random() * 70;
+  const aspect = 0.8 + Math.random() * 0.5;
+  const s = makeShape(px, py, maxDim, maxDim / aspect, true);
+  s.w = 0; s.h = 0; // start from a point so the camper gets a moment to react
+  shapes.push(s);
+  playAmbush();
+}
+
+// Distance from a point to the nearest ink edge (negative = inside ink).
+function gapAt(x, y) {
+  let g = Infinity;
+  for (const s of shapes) {
+    const lr = ((s.drawW || s.w) + (s.drawH || s.h)) / 2 * 0.44;
+    const d = Math.hypot(x - s.x, y - s.y) - lr;
+    if (d < g) g = d;
+  }
+  return g;
+}
+
+// Rising score popup. colorTpl contains 'A' where the fading alpha is injected.
+function addFloat(x, y, text, colorTpl, size) {
+  floats.push({ x, y, text, colorTpl, size, life: 850, maxLife: 850 });
+}
+
+// Spawn a mote in a risky gap — close to ink, but in safe white. Worth diving for.
+function spawnMote() {
+  for (let i = 0; i < 24; i++) {
+    const x = 36 + Math.random() * (W - 72), y = 36 + Math.random() * (H - 72);
+    if (pointCovered(x, y)) continue;
+    const g = gapAt(x, y);
+    if (g > 14 && g < DANGER_BAND * 0.9) {
+      // first few dots carry an engaging "collect me" tag so the goal is obvious
+      const msg = collected < 3 ? MOTE_MSGS[moteSpawnCount % MOTE_MSGS.length] : null;
+      motes.push({ x, y, life: 5200, msg });
+      moteSpawnCount++;
+      return;
+    }
+  }
+}
+
+// No dead ends: guarantee at least one dot the player can actually reach through
+// open (non-ink) space. Flood-fills the free space from the player; if no existing
+// mote sits in that reachable region, drops one there (preferring a risky edge).
+function ensureReachableMote() {
+  const cell = 34;
+  const cols = Math.max(1, Math.ceil(W / cell)), rows = Math.max(1, Math.ceil(H / cell));
+  const free = new Uint8Array(cols * rows);
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++)
+      free[r * cols + c] = pointCovered(c * cell + cell / 2, r * cell + cell / 2) ? 0 : 1;
+
+  const pc = Math.min(cols - 1, Math.max(0, Math.floor(px / cell)));
+  const pr = Math.min(rows - 1, Math.max(0, Math.floor(py / cell)));
+  const start = pr * cols + pc;
+  if (!free[start]) return; // player cell already ink → about to die anyway
+
+  const reach = new Uint8Array(cols * rows);
+  const queue = [start]; reach[start] = 1;
+  for (let qi = 0; qi < queue.length; qi++) {
+    const idx = queue[qi], cc = idx % cols, rr = (idx / cols) | 0;
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+      if (!dr && !dc) continue;
+      const nc = cc + dc, nr = rr + dr;
+      if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+      const ni = nr * cols + nc;
+      if (reach[ni] || !free[ni]) continue;
+      reach[ni] = 1; queue.push(ni);
+    }
+  }
+
+  const isReachable = mo => reach[
+    Math.min(rows - 1, Math.max(0, Math.floor(mo.y / cell))) * cols +
+    Math.min(cols - 1, Math.max(0, Math.floor(mo.x / cell)))] === 1;
+  if (motes.some(isReachable)) return; // a reachable dot already exists — all good
+
+  // pick a reachable cell: prefer ones nearest the ink (risky) and not on the player
+  const cands = [];
+  for (const idx of queue) {
+    const x = (idx % cols) * cell + cell / 2, y = ((idx / cols) | 0) * cell + cell / 2;
+    if (Math.hypot(x - px, y - py) < 70) continue;
+    cands.push({ x, y, g: gapAt(x, y) });
+  }
+  if (!cands.length) {
+    const idx = queue[queue.length >> 1]; // tiny pocket: drop one anywhere reachable
+    motes.push({ x: (idx % cols) * cell + cell / 2, y: ((idx / cols) | 0) * cell + cell / 2, life: 6000, msg: null });
+    return;
+  }
+  cands.sort((a, b) => a.g - b.g);
+  const pickC = cands[(Math.random() * Math.min(6, cands.length)) | 0];
+  motes.push({ x: pickC.x, y: pickC.y, life: 6000, msg: null });
 }
 
 // ─── Start / restart ──────────────────────────────────────────────────────────
@@ -338,11 +446,14 @@ function startGame() {
   ensureAudio();
   playStart();
   state = 'playing';
-  score = 0; elapsed = 0;
-  spawnTimer = -300; ambushTimer = 0; nextSpawn = 600; stillTime = 0;
+  nerve = 0; mult = 1; graze = 0; elapsed = 0;
+  motes.length = 0; moteTimer = 0; collected = 0; moteSpawnCount = 0; reachTimer = 0;
+  floats.length = 0;
+  spawnTimer = -300; ambushTimer = 0; nextSpawn = 600;
   occupancy = 0; occTimer = 0; progress = 0;
   shapes.length = 0;
   px = W / 2; py = H / 2;
+  campX = px; campY = py; campTime = 0;
   pdx = pdy = 0; targetX = px; targetY = py;
   pointerActive = false;
   overAlpha = 0;
@@ -384,16 +495,21 @@ function triggerGameOver() {
     if (ex*ex + ey*ey <= 1) { deathPal = s.pal; deathLobes = s.lobes; break; }
   }
   overAlpha = 0;
-  if (score > highScore) { highScore = score; localStorage.setItem('ns_hi_pct', highScore); }
+  saveBest();
   playGameOver();
+}
+
+function saveBest() {
+  const n = Math.round(nerve);
+  if (n > highScore) { highScore = n; localStorage.setItem('ns_nerve', highScore); }
 }
 
 let winAlpha = 0;
 function triggerWin() {
   state = 'won';
-  score = 100;
   winAlpha = 0;
-  if (score > highScore) { highScore = score; localStorage.setItem('ns_hi_pct', highScore); }
+  nerve += 250; // completion bonus for filling the void
+  saveBest();
   playWin();
 }
 
@@ -417,13 +533,12 @@ function update(t) {
   px = Math.max(PLAYER_R, Math.min(W - PLAYER_R, px));
   py = Math.max(PLAYER_R, Math.min(H - PLAYER_R, py));
 
-  // ── Anti-camp: standing still lets ink close in on you ──
-  const speed = Math.hypot(pdx, pdy);
-  if (elapsed > 2200 && speed < 1.4) {
-    stillTime += dt;
-    if (stillTime > 1200) { stillTime = 0; spawnFlush(); playAmbush(); }
-  } else {
-    stillTime = Math.max(0, stillTime - dt * 1.6); // keep moving to relieve pressure
+  // ── Anti-camp: lingering in one spot (e.g. a corner) makes ink form under you ──
+  if (Math.hypot(px - campX, py - campY) > CAMP_R) {
+    campX = px; campY = py; campTime = 0; // roamed far enough → reset the anchor
+  } else if (elapsed > 2500) {
+    campTime += dt;
+    if (campTime > CAMP_FULL) { campTime = 0; spawnUnderCursor(); } // camping → blob on you
   }
 
   spawnTimer += dt;
@@ -432,8 +547,8 @@ function update(t) {
     // irregular cadence — sometimes a quick flurry, sometimes a long calm
     nextSpawn = d.spawnInterval * (0.4 + Math.random() * 1.3);
     spawnShape();
-    // sudden burst: a cluster blooms at once
-    if (Math.random() < 0.24) { spawnShape(); if (Math.random() < 0.45) spawnShape(); }
+    // sudden burst: a cluster blooms at once (only once difficulty has ramped)
+    if (Math.random() < d.burst) { spawnShape(); if (Math.random() < 0.4) spawnShape(); }
     playBloom();
   }
 
@@ -455,15 +570,48 @@ function update(t) {
     s.drawH = s.h * (1 + pf * s.pulseAmp);
   }
 
-  // ── Precise occupancy → score (progress toward filling the void) ──
-  occTimer += dt;
-  if (occTimer >= 110) { occTimer = 0; measureOccupancy(); }
-  progress = Math.min(1, occupancy / WIN_FILL);
-  score = Math.round(progress * 100);
+  // ── Proximity → multiplier (the closer to ink, the more a dot is worth) ──
+  const gap = gapAt(px, py);
+  graze = gap < DANGER_BAND ? Math.max(0, 1 - Math.max(0, gap) / DANGER_BAND) : 0;
+  const target = 1 + graze * (MAX_MULT - 1);
+  mult += (target - mult) * Math.min(1, dt * (target > mult ? 0.012 : 0.004));
+  if (mult < 1) mult = 1;
 
-  // death takes precedence; otherwise reaching a full void is a WIN
+  // NERVE: a small trickle for surviving, but it climbs FAST the closer you hug
+  // the ink — risk pays continuously, scaled by the live multiplier (not just on
+  // pickups). Collecting dots is still the big burst payoff (40 × mult).
+  nerve += dt / 1000 * (2 + graze * mult * 6);
+
+  // ── Motes: the collectibles. They sit in risky gaps; worth more the closer
+  //    to the ink you grab them (current multiplier). ──
+  moteTimer += dt;
+  if (moteTimer > 1200 && motes.length < 5) { moteTimer = 0; spawnMote(); }
+  // no dead ends: keep a reachable dot available at all times
+  reachTimer += dt;
+  if (reachTimer > 450) { reachTimer = 0; ensureReachableMote(); }
+  for (let i = motes.length - 1; i >= 0; i--) {
+    const mo = motes[i];
+    mo.life -= dt;
+    if (Math.hypot(px - mo.x, py - mo.y) < 18) {       // collected (hover over it)
+      const gained = Math.round(40 * mult);
+      nerve += gained;
+      collected++;
+      addFloat(mo.x, mo.y, '+' + gained, 'rgba(199,154,58,A)', 16);
+      motes.splice(i, 1); playMote();
+    } else if (mo.life <= 0 || pointCovered(mo.x, mo.y)) {
+      motes.splice(i, 1);                              // expired or swallowed by ink
+    }
+  }
+
+  // rising score popups
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.life -= dt; f.y -= dt * 0.022;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+
+  // run ends when the ink consumes you
   if (playerCovered()) { triggerGameOver(); return; }
-  if (occupancy >= WIN_FILL) triggerWin();
 }
 
 // ─── Drawing primitives ───────────────────────────────────────────────────────
@@ -520,8 +668,18 @@ function mmss(ms) {
   return String((s / 60) | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
 }
 
-function drawPlayer(x, y, extra = 0) {
+function drawPlayer(x, y, extra = 0, gz = 0) {
   const r = PLAYER_R + 0.4 * Math.sin(pulse) + extra;
+  // grazing glow — the dot runs hot when hugging danger (instant risk feedback)
+  if (gz > 0) {
+    const rg = r + 7 + gz * 16 + gz * 2 * Math.sin(pulse * 2.2);
+    const a = 0.18 + gz * 0.55;
+    const hot = ctx.createRadialGradient(x, y, r, x, y, rg);
+    hot.addColorStop(0, `rgba(240,86,96,${a})`);
+    hot.addColorStop(1, 'rgba(240,86,96,0)');
+    ctx.fillStyle = hot;
+    ctx.beginPath(); ctx.arc(x, y, rg, 0, Math.PI * 2); ctx.fill();
+  }
   // soft luminous halo so the dot reads on any colour
   const h = ctx.createRadialGradient(x, y, 0, x, y, r + 9);
   h.addColorStop(0, 'rgba(255,255,255,0.85)');
@@ -537,74 +695,126 @@ function drawPlayer(x, y, extra = 0) {
   ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
 }
 
-// ─── Corner chrome (editorial frame) ─────────────────────────────────────────--
+// ─── Editorial ink tones ─────────────────────────────────────────────────────
 const INK = '#7c766c', INK_SOFT = '#a8a298', INK_FAINT = 'rgba(124,118,108,0.45)';
-function drawCorners(catalog) {
-  const m = Math.max(18, Math.min(W, H) * 0.05);
-  label('NEGATIVE SPACE', m, m + 4, 11, INK, 'left', '0.28em', '600');
-  label('— PERCEPTUAL SURVIVAL', m, m + 22, 9, INK_SOFT, 'left', '0.24em', '500');
-  label(catalog, W - m, m + 4, 11, INK, 'right', '0.24em', '600');
-  label('ORIGINAL MIX', W - m, m + 22, 9, INK_SOFT, 'right', '0.24em', '500');
-}
 
 // ─── Screens ───────────────────────────────────────────────────────────────--
 const heroOrb = { x: 0, y: 0, w: 0, h: 0, drawW: 0, drawH: 0, pal: COOL[0],
                   lobes: makeLobes() };
+// palettes the hero blob drifts through as it breathes
+const HERO_CYCLE = [COOL[0], COOL[1], COOL[2], HOT[3], HOT[1], HOT[0]];
+const HERO_HOLD = 5200; // ms per colour
 
 function drawIntro(t) {
   drawBg();
-  // hero orb, breathing
-  const base = Math.min(W, H) * 0.32;
-  const pf = Math.sin(t * 0.0011);
-  heroOrb.x = W / 2; heroOrb.y = H * 0.43;
-  heroOrb.drawW = heroOrb.drawH = base * (1 + pf * 0.05);
-  drawOrb(heroOrb, 1, t);
-
-  drawCorners('NS — 000');
-
-  // title block (editorial, lower third)
   ctx.textAlign = 'center';
-  label('NEGATIVE SPACE', W / 2, H * 0.74, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.3em', '700');
-  label('YOU EXIST ONLY IN WHAT REMAINS', W / 2, H * 0.74 + 26, Math.min(11, W * 0.026), INK_SOFT, 'center', '0.26em', '500');
 
-  // CTA
+  // ── Title + tagline, above the blob ──
+  const tSize = Math.min(70, W * 0.135);
+  label('NERVE', W / 2, H * 0.16, tSize, '#3f3a33', 'center', '0.4em', '700');
+  label('COLLECT DOTS.  AVOID BLOBS.', W / 2, H * 0.16 + tSize * 0.6,
+        Math.min(11, W * 0.024), INK_SOFT, 'center', '0.42em', '500');
+
+  // ── Hero blob (atmospheric) — breathing + colour drift, collectible dot at heart ──
+  const base = Math.min(W, H) * 0.30;
+  const pf = Math.sin(t * 0.0011);
+  heroOrb.x = W / 2; heroOrb.y = H * 0.48;
+  heroOrb.drawW = heroOrb.drawH = base * (1 + pf * 0.05);
+  const span = (t % (HERO_HOLD * HERO_CYCLE.length)) / HERO_HOLD;
+  const i0 = Math.floor(span) % HERO_CYCLE.length, i1 = (i0 + 1) % HERO_CYCLE.length;
+  const f = span - Math.floor(span), e = f * f * (3 - 2 * f); // smoothstep crossfade
+  heroOrb.pal = HERO_CYCLE[i0]; drawOrb(heroOrb, 1 - e, t);
+  heroOrb.pal = HERO_CYCLE[i1]; drawOrb(heroOrb, e, t);
+  drawMote({ x: heroOrb.x, y: heroOrb.y, life: 9999, msg: null }, t);
+
+  // ── CTA — detached, below the blob, the last thing you read ──
   const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
   ctx.globalAlpha = blink;
-  label('TAP TO BEGIN', W / 2, H * 0.86, Math.min(12, W * 0.028), '#3f3a33', 'center', '0.34em', '600');
+  label('TAP TO BEGIN', W / 2, H * 0.82, Math.min(12, W * 0.026), '#3f3a33', 'center', '0.44em', '600');
   ctx.globalAlpha = 1;
 
-  if (highScore > 0)
-    label('BEST  ' + highScore + '%', W / 2, H * 0.91, 10, INK_FAINT, 'center', '0.26em', '500');
-
   drawGrain();
+}
+
+// A collectible glint — amber so it reads on the cream paper, with a target ring
+// that pulses so it reads as a "step here for points" zone.
+function drawMote(mo, t) {
+  const tw = 0.55 + 0.45 * Math.sin(t * 0.006 + mo.x * 0.05);
+  const fade = Math.min(1, mo.life / 900);
+  const g = ctx.createRadialGradient(mo.x, mo.y, 0, mo.x, mo.y, 17);
+  g.addColorStop(0,   `rgba(255,206,110,${0.95 * tw * fade})`);
+  g.addColorStop(0.5, `rgba(244,176,86,${0.40 * tw * fade})`);
+  g.addColorStop(1,   'rgba(244,176,86,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(mo.x, mo.y, 17, 0, Math.PI * 2); ctx.fill();
+  // pulsing target ring
+  const ring = 9 + 4 * (0.5 + 0.5 * Math.sin(t * 0.005 + mo.y * 0.05));
+  ctx.strokeStyle = `rgba(199,154,58,${0.5 * fade})`;
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.arc(mo.x, mo.y, ring, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = `rgba(80,60,30,${0.6 * fade})`;
+  ctx.beginPath(); ctx.arc(mo.x, mo.y, 1.7, 0, Math.PI * 2); ctx.fill();
+  // engaging "collect me" tag on the first dots, gently bobbing
+  if (mo.msg) {
+    const bob = Math.sin(t * 0.005 + mo.x) * 2;
+    label(mo.msg, mo.x, mo.y - 20 + bob, 10, `rgba(199,140,48,${0.9 * fade})`, 'center', '0.18em', '700');
+  }
+}
+
+// Rising "+NERVE" popups.
+function drawFloats() {
+  ctx.textAlign = 'center';
+  ctx.letterSpacing = '0.04em';
+  for (const f of floats) {
+    const a = Math.max(0, f.life / f.maxLife);
+    ctx.font = `700 ${f.size}px 'Helvetica Neue', Helvetica, Arial, sans-serif`;
+    ctx.fillStyle = f.colorTpl.replace('A', (a * 0.9).toFixed(2));
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.letterSpacing = '0em';
 }
 
 function drawGame(t) {
   drawBg();
   for (const s of shapes) drawOrb(s, 1, t);
-  drawPlayer(px, py);
+  for (const mo of motes) drawMote(mo, t);
+
+  // camp warning — a tightening ring forms under a lingering player before ink does
+  if (campTime > CAMP_FULL - CAMP_WARN) {
+    const w = (campTime - (CAMP_FULL - CAMP_WARN)) / CAMP_WARN; // 0→1
+    const rr = 46 * (1 - w) + 10;
+    ctx.strokeStyle = `rgba(214,74,86,${0.25 + 0.55 * w})`;
+    ctx.lineWidth = 1.5 + w * 1.5;
+    ctx.beginPath(); ctx.arc(px, py, rr, 0, Math.PI * 2); ctx.stroke();
+    if (w > 0.4) { ctx.textAlign = 'center'; label('MOVE', px, py - rr - 8, 9, `rgba(214,74,86,${w})`, 'center', '0.3em', '700'); }
+  }
+
+  drawPlayer(px, py, 0, graze);
+  drawFloats();
 
   const m = Math.max(18, Math.min(W, H) * 0.05);
 
-  // top-left branding
-  label('NEGATIVE SPACE', m, m + 4, 11, INK, 'left', '0.28em', '600');
-  label('— PERCEPTUAL SURVIVAL', m, m + 22, 9, INK_SOFT, 'left', '0.24em', '500');
+  // top-left branding — single line: bold name, then muted tagline
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.font = "600 11px 'Helvetica Neue', Helvetica, Arial, sans-serif";
+  ctx.letterSpacing = '0.28em';
+  ctx.fillStyle = INK;
+  ctx.fillText('NERVE', m, m + 8);
+  const nameW = ctx.measureText('NERVE').width;
+  ctx.font = "500 9px 'Helvetica Neue', Helvetica, Arial, sans-serif";
+  ctx.letterSpacing = '0.24em';
+  ctx.fillStyle = INK_SOFT;
+  ctx.fillText('—  COLLECT DOTS.  AVOID BLOBS.', m + nameW + 14, m + 8);
+  ctx.letterSpacing = '0em';
 
-  // top-right — big % of the void survived (the score)
-  label('SPACE SURVIVED', W - m, m + 2, 9, INK_SOFT, 'right', '0.24em', '500');
-  label(score + '%', W - m, m + 36, Math.min(32, W * 0.064), '#3f3a33', 'right', '0.02em', '700');
+  // top-right — NERVE (the score) + live multiplier, hotter the closer you fly
+  label('SCORE', W - m, m + 2, 9, INK_SOFT, 'right', '0.24em', '500');
+  label(Math.round(nerve).toString(), W - m, m + 36, Math.min(32, W * 0.064), '#3f3a33', 'right', '0.02em', '700');
+  const cr = (63 + (240 - 63) * graze) | 0, cg = (58 + (86 - 58) * graze) | 0, cb = (51 + (96 - 51) * graze) | 0;
+  label('×' + mult.toFixed(1), W - m, m + 56, 13, `rgb(${cr},${cg},${cb})`, 'right', '0.06em', '700');
 
-  // bottom — precise progress bar toward a full void (100% = win)
-  const barX = m, barW = W - m * 2, barY = H - m - 5, barH = 4;
-  label('THE VOID', barX, barY - 11, 9, INK_SOFT, 'left', '0.26em', '500');
-  label(score + '% / 100%   ·   ' + mmss(elapsed), barX + barW, barY - 11, 9, INK_SOFT, 'right', '0.26em', '500');
-  ctx.fillStyle = INK_FAINT;
-  ctx.fillRect(barX, barY, barW, barH);
-  ctx.fillStyle = '#3f3a33';
-  ctx.fillRect(barX, barY, barW * progress, barH);
-  // leading edge marker
-  ctx.fillStyle = '#3f3a33';
-  ctx.fillRect(barX + barW * progress - 1, barY - 3, 2, barH + 6);
+  // bottom-left — quiet survival clock
+  label(mmss(elapsed), m, H - m, 12, INK_SOFT, 'left', '0.12em', '600');
 
   drawGrain();
 }
@@ -631,13 +841,14 @@ function drawOver(t) {
   const a = Math.min(1, (overAlpha - 0.35) / 0.4);
   ctx.globalAlpha = a;
 
-  label('CONSUMED', W / 2, H * 0.40, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.32em', '700');
-  label('SPACE SURVIVED', W / 2, H * 0.49, 10, INK_SOFT, 'center', '0.3em', '500');
-  label(score + '%', W / 2, H * 0.49 + 40, Math.min(44, W * 0.092), '#3f3a33', 'center', '0.02em', '700');
-  label('IN ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.26em', '500');
+  const nv = Math.round(nerve), best = nv >= highScore;
+  label('GONE', W / 2, H * 0.40, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.32em', '700');
+  label('SCORE', W / 2, H * 0.49, 10, INK_SOFT, 'center', '0.3em', '500');
+  label(nv.toString(), W / 2, H * 0.49 + 40, Math.min(44, W * 0.092), '#3f3a33', 'center', '0.02em', '700');
+  label(collected + ' DOTS  ·  SURVIVED ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.24em', '500');
 
-  label(score >= highScore ? 'NEW BEST' : 'BEST  ' + highScore + '%',
-        W / 2, H * 0.67, 10, score >= highScore ? '#3f3a33' : INK_FAINT, 'center', '0.28em', '600');
+  label(best ? 'NEW BEST' : 'BEST SCORE  ' + highScore,
+        W / 2, H * 0.67, 10, best ? '#3f3a33' : INK_FAINT, 'center', '0.28em', '600');
 
   const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
   ctx.globalAlpha = a * blink;
@@ -660,10 +871,11 @@ function drawWin(t) {
   const a = Math.min(1, (winAlpha - 0.35) / 0.45);
   ctx.globalAlpha = a;
 
-  label('COMPLETE', W / 2, H * 0.39, Math.min(36, W * 0.076), '#3f3a33', 'center', '0.34em', '700');
-  label('YOU SURVIVED THE FULL VOID', W / 2, H * 0.48, 10, INK_SOFT, 'center', '0.3em', '500');
-  label('100%', W / 2, H * 0.48 + 46, Math.min(50, W * 0.105), '#c79a3a', 'center', '0.02em', '700'); // gold
-  label('IN ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.26em', '500');
+  label('COMPLETE', W / 2, H * 0.38, Math.min(36, W * 0.076), '#3f3a33', 'center', '0.34em', '700');
+  label('YOU FILLED THE VOID', W / 2, H * 0.47, 10, INK_SOFT, 'center', '0.3em', '500');
+  label(Math.round(nerve).toString(), W / 2, H * 0.47 + 48, Math.min(52, W * 0.108), '#c79a3a', 'center', '0.02em', '700'); // gold nerve
+  label('SCORE  ·  ' + mmss(elapsed) + (Math.round(nerve) >= highScore ? '  ·  NEW BEST' : ''),
+        W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.24em', '500');
 
   const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
   ctx.globalAlpha = a * blink;
