@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#f2efe9">
+<title>Negative Space</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  background: #efebe4;
+  font-family: 'Helvetica Neue', 'Inter', Helvetica, Arial, sans-serif;
+  user-select: none; -webkit-user-select: none;
+  touch-action: none;
+  overscroll-behavior: none;
+}
+canvas {
+  display: block;
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+// ─── Canvas setup ────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, DPR;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Palettes (iridescent gradient orbs) ─────────────────────────────────────
+// hi = inner highlight, c1/c2 = body hues, edge = rim, acc = iridescent bloom, glow = halo
+const COOL = [
+  { hi:[227,236,249], c1:[150,190,240], c2:[193,168,232], edge:[140,152,214], acc:[255,201,226], glow:[181,201,242] }, // blue→lavender→pink
+  { hi:[231,225,251], c1:[140,124,240], c2:[181,167,245], edge:[118,106,208], acc:[201,182,255], glow:[177,165,245] }, // violet
+  { hi:[233,250,241], c1:[111,217,192], c2:[152,201,230], edge:[ 88,180,170], acc:[243,224,138], glow:[151,221,201] }, // mint→teal
+  { hi:[224,240,247], c1:[122,196,224], c2:[171,182,232], edge:[104,150,200], acc:[230,196,238], glow:[160,200,232] }, // ice
+];
+const HOT = [
+  { hi:[255,224,207], c1:[255,154,107], c2:[255, 93,143], edge:[206, 78,138], acc:[201, 92,192], glow:[255,179,143] }, // sunset
+  { hi:[255,230,239], c1:[255, 90,125], c2:[208, 75,196], edge:[150, 60,140], acc:[120, 90,180], glow:[255,150,180] }, // pink fire
+  { hi:[246,236,226], c1:[ 82, 92,132], c2:[150,110,140], edge:[ 58, 58, 94], acc:[208,160,106], glow:[150,130,150] }, // hallucinate
+  { hi:[255,236,210], c1:[255,176, 92], c2:[233,118, 96], edge:[190, 92, 96], acc:[238,108,150], glow:[255,196,150] }, // amber→coral
+];
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const darken = (c, f) => [c[0]*f|0, c[1]*f|0, c[2]*f|0];
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+
+// ─── Organic liquid blobs (animated metaballs) ───────────────────────────────
+// One soft lobe sprite is baked per palette. A blob is several of these lobes
+// that drift & swell on independent sine waves, so its silhouette morphs like
+// liquid ink. Overlaps deepen the core; the global grain adds the printed grit.
+const LOBE = 200, LOBE_PAD = 1.3, TAU = Math.PI * 2;
+function renderLobe(pal) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = LOBE;
+  const x = cv.getContext('2d');
+  x.translate(LOBE / 2, LOBE / 2);
+  const r = LOBE / 2 / LOBE_PAD;
+  x.filter = `blur(${(r * 0.22).toFixed(1)}px)`;
+  // No hard dark core — a soft rich center that fades smoothly. Depth comes from
+  // overlapping lobes accumulating, not from one near-black dot per lobe.
+  const g = x.createRadialGradient(0, 0, 0, 0, 0, r);
+  g.addColorStop(0,    rgba(pal.edge, 0.5));
+  g.addColorStop(0.35, rgba(pal.c1,   0.46));
+  g.addColorStop(0.70, rgba(pal.c2,   0.24));
+  g.addColorStop(1,    rgba(pal.c2,   0));
+  x.fillStyle = g;
+  x.beginPath(); x.arc(0, 0, r, 0, TAU); x.fill();
+  return cv;
+}
+[...COOL, ...HOT].forEach(p => { p.lobe = renderLobe(p); });
+
+const rnd = Math.random;
+function lobe(ox, oy, rr, morph) {
+  return {
+    ox, oy, rr,
+    // drift (offset wobble) + swell (radius wobble), each its own freq & phase.
+    // morph scales the amplitudes so some blobs are calm, others very liquid.
+    fxo: 0.0005 + rnd() * 0.0012, fyo: 0.0005 + rnd() * 0.0012, fr: 0.0006 + rnd() * 0.0014,
+    axo: (0.05 + rnd() * 0.14) * morph, ayo: (0.05 + rnd() * 0.14) * morph, ar: (0.10 + rnd() * 0.20) * morph,
+    pxo: rnd() * TAU,                   pyo: rnd() * TAU,                   pr: rnd() * TAU,
+  };
+}
+// Each blob picks its own character: how many lobes, how far they spread, how
+// liquid it morphs — so silhouettes range from tight droplets to sprawling amoebas.
+function makeLobes(sf = 1) {
+  const spread = 0.18 + rnd() * 0.42;                    // tight ↔ sprawling, pushed wider
+  const morph  = (0.5 + rnd() * 1.0) * (0.6 + sf * 0.7); // bigger blobs morph more liquidly
+  const baseR  = 0.40 + rnd() * 0.34;
+  const n = 3 + (rnd() * (3 + rnd() * 6) | 0); // ~3–11 lobes → bumpier outline
+  // off-centre, smaller "core" so the blob isn't a dominant round mass
+  const lobes = [lobe(Math.cos(rnd()*TAU)*spread*0.3, Math.sin(rnd()*TAU)*spread*0.3,
+                      baseR * (0.85 + rnd() * 0.4), morph)];
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * TAU, d = spread * (0.5 + rnd() * 1.15);
+    lobes.push(lobe(Math.cos(a) * d, Math.sin(a) * d, baseR * (0.28 + rnd() * 0.9), morph));
+  }
+  return lobes;
+}
+
+// ─── Film grain (pre-rendered tile) ───────────────────────────────────────────
+const grain = document.createElement('canvas');
+grain.width = grain.height = 180;
+(() => {
+  const g = grain.getContext('2d');
+  const id = g.createImageData(180, 180);
+  for (let i = 0; i < id.data.length; i += 4) {
+    const v = (Math.random() * 255) | 0;
+    id.data[i] = id.data[i+1] = id.data[i+2] = v;
+    id.data[i+3] = (Math.random() * 42) | 0;
+  }
+  g.putImageData(id, 0, 0);
+})();
+const grainPattern = ctx.createPattern(grain, 'repeat');
+
+// ─── State ───────────────────────────────────────────────────────────────────
+let state = 'intro';                                  // intro | playing | over
+let score = 0;
+let highScore = +localStorage.getItem('ns_hi_pct') || 0;
+let elapsed = 0;
+
+// ─── Player ──────────────────────────────────────────────────────────────────
+const PLAYER_R = 5;
+let px, py, pdx = 0, pdy = 0, targetX, targetY;
+let pulse = 0;
+
+// ─── Shapes ────────────────────────────────────────────────────────────────--
+const shapes = [];
+let spawnTimer = 0, ambushTimer = 0, nextSpawn = 600, stillTime = 0;
+
+// When this fraction of the screen is occupied by ink, the void is "full" → WIN.
+// Score is your progress toward it (0–100%), measured precisely from real coverage.
+const WIN_FILL = 0.62;
+let occupancy = 0, occTimer = 0, progress = 0;
+
+// ─── Pointer ───────────────────────────────────────────────────────────────--
+let pointerActive = false;
+function onPointerMove(e) {
+  const r = canvas.getBoundingClientRect();
+  const cx = e.touches ? e.touches[0].clientX : e.clientX;
+  const cy = e.touches ? e.touches[0].clientY : e.clientY;
+  targetX = (cx - r.left) * (W / r.width);
+  targetY = (cy - r.top)  * (H / r.height);
+  pointerActive = true;
+}
+function onPointerEnd() { pointerActive = false; }
+canvas.addEventListener('mousemove',  onPointerMove);
+canvas.addEventListener('touchmove',  onPointerMove, { passive: true });
+canvas.addEventListener('touchstart', onPointerMove, { passive: true });
+canvas.addEventListener('touchend',   onPointerEnd);
+canvas.addEventListener('click', handleTap);
+let lastTouchEnd = 0;
+canvas.addEventListener('touchend', e => {
+  if (!e.changedTouches.length) return;
+  const now = Date.now();
+  if (now - lastTouchEnd < 300) return;
+  lastTouchEnd = now;
+  handleTap();
+}, { passive: true });
+function handleTap() {
+  if (state === 'intro' || state === 'over' || state === 'won') startGame();
+}
+
+// ─── Audio (soft synth pads) ──────────────────────────────────────────────────
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+function tone(freq, dur, type = 'sine', vol = 0.12, detune = 0) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.type = type; o.frequency.value = freq; o.detune.value = detune;
+  const now = audioCtx.currentTime;
+  g.gain.setValueAtTime(0.0001, now);
+  g.gain.exponentialRampToValueAtTime(vol, now + 0.04);
+  g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  o.start(now); o.stop(now + dur);
+}
+// A single scheduled note (delay & dur in seconds), with a soft attack/decay.
+function note(freq, delay, dur, type = 'sine', vol = 0.12, detune = 0) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.type = type; o.frequency.value = freq; o.detune.value = detune;
+  const t0 = audioCtx.currentTime + delay;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.025);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.start(t0); o.stop(t0 + dur + 0.05);
+}
+
+// A soft sine "bloom" — slow swell then fade, the core voice of the whole game.
+// Start & end cues are built from these so everything sounds like the same ink.
+function bloomNote(freq, delay, dur, vol = 0.06, detune = 0) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.type = 'sine'; o.frequency.value = freq; o.detune.value = detune;
+  const t0 = audioCtx.currentTime + delay;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + dur * 0.38); // slow swell, like ink spreading
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.start(t0); o.stop(t0 + dur + 0.05);
+}
+
+// A single blob appearing — one soft bloom + a fifth shimmer (the reference voice).
+const playBloom  = () => { const f = 300 + Math.random()*150; bloomNote(f, 0, 0.6, 0.05); bloomNote(f * 1.5, 0, 0.5, 0.03, 6); };
+const playAmbush = () => { tone(170, 0.4, 'triangle', 0.06); };
+
+// START — a rising cluster of blooms, like the first blobs blossoming in.
+function playStart() {
+  const seq = [294, 392, 494, 659]; // D4 G4 B4 E5 — open & soft
+  seq.forEach((f, i) => { bloomNote(f, i * 0.13, 0.75, 0.06); bloomNote(f * 1.5, i * 0.13, 0.6, 0.025, 6); });
+  bloomNote(147, 0, 0.95, 0.05);     // warm root bloom
+  bloomNote(988, 0.42, 0.6, 0.025);  // final high shimmer
+}
+
+// GAME OVER — the same blooms descending, settling into a low pooling bloom.
+function playGameOver() {
+  const seq = [494, 392, 294, 196]; // B4 G4 D4 G3 — sinking
+  seq.forEach((f, i) => { bloomNote(f, i * 0.18, 0.85, 0.06); bloomNote(f * 1.5, i * 0.18, 0.55, 0.022, -4); });
+  bloomNote(98,  0.70, 1.7, 0.07, -5); // low bloom pool
+  bloomNote(147, 0.74, 1.4, 0.05);
+}
+
+// WIN — a bright, resolving chord of blooms blossoming upward: the void is full.
+function playWin() {
+  const chord = [392, 494, 587, 784, 988]; // G B D G B — open & triumphant
+  chord.forEach((f, i) => { bloomNote(f, i * 0.10, 1.4, 0.06); bloomNote(f * 1.5, i * 0.10, 1.0, 0.022, 5); });
+  bloomNote(196, 0, 1.8, 0.06);          // warm root
+  bloomNote(1318, 0.55, 1.0, 0.03);      // high sparkle
+}
+
+// ─── Difficulty ───────────────────────────────────────────────────────────────
+function difficulty() {
+  const t = elapsed / 1000;
+  const p = Math.min(1, t / 90);
+  const ease = p * p * (3 - 2 * p);
+  return {
+    spawnInterval:  1200 - ease * 700,
+    shapeSpeed:     0.32 + ease * 0.80,
+    maxDimBase:     130  + ease * 220,
+    ambushChance:   Math.max(0, (t - 3) / 12),
+    ambushInterval: Math.max(1800, 5000 - ease * 3200),
+  };
+}
+
+// ─── Shapes ────────────────────────────────────────────────────────────────--
+function makeShape(x, y, maxW, maxH, hot) {
+  const pal = hot ? pick(HOT) : pick(Math.random() > 0.45 ? COOL : HOT);
+  const sf = Math.min(2.2, maxW / 250); // size factor — bigger blobs are more alive
+  return {
+    // start at a visible fraction so the blob POPS into being, then keeps growing
+    x, y, w: maxW * 0.22, h: maxH * 0.22, maxW, maxH,
+    growing: true,
+    pal,
+    lobes: makeLobes(sf),
+    pulseFreq:  0.0008 + Math.random() * 0.0014,
+    pulseAmp:  (0.07 + Math.random() * 0.10) * (0.6 + sf * 0.7), // larger → pulses harder
+    pulsePhase: Math.random() * Math.PI * 2,
+    born: elapsed,
+  };
+}
+function spawnShape() {
+  const d = difficulty();
+  // wide size diversity: tiny specks → sprawling masses, with occasional giants
+  let maxDim = d.maxDimBase * (0.28 + Math.random() * 1.9);
+  if (Math.random() < 0.16) maxDim *= 1.7;
+  const aspect = 0.5 + Math.random() * 1.1;
+  const maxW = maxDim, maxH = maxDim / aspect;
+  let x, y, a = 0;
+  const safeR = 100 + Math.max(maxW, maxH) * 0.35;
+  do {
+    x = maxW * 0.3 + Math.random() * (W - maxW * 0.6);
+    y = maxH * 0.3 + Math.random() * (H - maxH * 0.6);
+    a++;
+  } while (a < 30 && Math.hypot(x - px, y - py) < safeR);
+  // never let the fallback drop a blob on the cursor — skip if still too close
+  if (Math.hypot(x - px, y - py) < safeR) return;
+  shapes.push(makeShape(x, y, maxW, maxH, false));
+}
+// Place a blob NEAR the player but never under the cursor. `clear` is the minimum
+// gap from the player to the blob's edge. Tries several angles and — because
+// clamping to screen edges can pull a blob back toward a cornered player — keeps
+// the candidate that stays furthest, so it never lands on top of you.
+function spawnNear(maxW, maxH, gapMin, gapExtra, hot) {
+  // initial footprint half-size (blobs pop in at 22%, lobes spread the edge ~1.5×)
+  const clear = maxW * 0.22 * 0.5 * 1.5 + PLAYER_R + gapMin;
+  let best = null, bestD = -1;
+  for (let i = 0; i < 12; i++) {
+    const ang = Math.random() * TAU;
+    const dist = clear + Math.random() * gapExtra;
+    const x = Math.max(maxW/2, Math.min(W - maxW/2, px + Math.cos(ang) * dist));
+    const y = Math.max(maxH/2, Math.min(H - maxH/2, py + Math.sin(ang) * dist));
+    const d = Math.hypot(x - px, y - py);
+    if (d >= clear) { shapes.push(makeShape(x, y, maxW, maxH, hot)); return; }
+    if (d > bestD) { bestD = d; best = { x, y }; }
+  }
+  shapes.push(makeShape(best.x, best.y, maxW, maxH, hot));
+}
+
+function spawnAmbush() {
+  const maxDim = 90 + Math.random() * 90;
+  const aspect = 0.72 + Math.random() * 0.7;
+  spawnNear(maxDim, maxDim / aspect, 30, 55, true);
+}
+
+// Anti-camp flush — ink blooms close beside a stationary player, forcing a move
+function spawnFlush() {
+  const maxDim = 70 + Math.random() * 70;
+  const aspect = 0.7 + Math.random() * 0.7;
+  spawnNear(maxDim, maxDim / aspect, 24, 38, true);
+}
+
+// ─── Start / restart ──────────────────────────────────────────────────────────
+function startGame() {
+  ensureAudio();
+  playStart();
+  state = 'playing';
+  score = 0; elapsed = 0;
+  spawnTimer = -300; ambushTimer = 0; nextSpawn = 600; stillTime = 0;
+  occupancy = 0; occTimer = 0; progress = 0;
+  shapes.length = 0;
+  px = W / 2; py = H / 2;
+  pdx = pdy = 0; targetX = px; targetY = py;
+  pointerActive = false;
+  overAlpha = 0;
+}
+
+// ─── Coverage ──────────────────────────────────────────────────────────────--
+// A point is "occupied" if it falls inside any blob's lethal footprint
+// (~88% of the visual radius, so the soft rim stays forgiving).
+function pointCovered(x, y) {
+  for (const s of shapes) {
+    const ex = (x - s.x) / ((s.drawW || s.w) * 0.44 + 0.001);
+    const ey = (y - s.y) / ((s.drawH || s.h) * 0.44 + 0.001);
+    if (ex*ex + ey*ey <= 1) return true;
+  }
+  return false;
+}
+function playerCovered() { return pointCovered(px, py); }
+
+// Precise occupancy — sample a grid of points and count how many are ink.
+function measureOccupancy() {
+  const step = Math.max(15, Math.min(W, H) / 44);
+  let total = 0, cov = 0;
+  for (let y = step / 2; y < H; y += step)
+    for (let x = step / 2; x < W; x += step) {
+      total++;
+      if (pointCovered(x, y)) cov++;
+    }
+  occupancy = total ? cov / total : 0;
+}
+
+// ─── Game over ─────────────────────────────────────────────────────────────--
+let overAlpha = 0, deathX = 0, deathY = 0, deathPal = COOL[0], deathLobes = makeLobes();
+function triggerGameOver() {
+  state = 'over';
+  deathX = px; deathY = py;
+  for (const s of shapes) {
+    const ex = (px - s.x) / ((s.drawW || s.w) * 0.5 + 0.001);
+    const ey = (py - s.y) / ((s.drawH || s.h) * 0.5 + 0.001);
+    if (ex*ex + ey*ey <= 1) { deathPal = s.pal; deathLobes = s.lobes; break; }
+  }
+  overAlpha = 0;
+  if (score > highScore) { highScore = score; localStorage.setItem('ns_hi_pct', highScore); }
+  playGameOver();
+}
+
+let winAlpha = 0;
+function triggerWin() {
+  state = 'won';
+  score = 100;
+  winAlpha = 0;
+  if (score > highScore) { highScore = score; localStorage.setItem('ns_hi_pct', highScore); }
+  playWin();
+}
+
+// ─── Update ────────────────────────────────────────────────────────────────--
+let lastT = 0;
+function update(t) {
+  const dt = Math.min(t - lastT, 80);
+  lastT = t;
+  pulse += dt * 0.004;
+  if (state !== 'playing') return;
+
+  elapsed += dt;
+  const d = difficulty();
+
+  if (pointerActive) {
+    pdx += (targetX - px) * 0.18;
+    pdy += (targetY - py) * 0.18;
+  }
+  pdx *= 0.72; pdy *= 0.72;
+  px += pdx; py += pdy;
+  px = Math.max(PLAYER_R, Math.min(W - PLAYER_R, px));
+  py = Math.max(PLAYER_R, Math.min(H - PLAYER_R, py));
+
+  // ── Anti-camp: standing still lets ink close in on you ──
+  const speed = Math.hypot(pdx, pdy);
+  if (elapsed > 2200 && speed < 1.4) {
+    stillTime += dt;
+    if (stillTime > 1200) { stillTime = 0; spawnFlush(); playAmbush(); }
+  } else {
+    stillTime = Math.max(0, stillTime - dt * 1.6); // keep moving to relieve pressure
+  }
+
+  spawnTimer += dt;
+  if (spawnTimer >= nextSpawn) {
+    spawnTimer = 0;
+    // irregular cadence — sometimes a quick flurry, sometimes a long calm
+    nextSpawn = d.spawnInterval * (0.4 + Math.random() * 1.3);
+    spawnShape();
+    // sudden burst: a cluster blooms at once
+    if (Math.random() < 0.24) { spawnShape(); if (Math.random() < 0.45) spawnShape(); }
+    playBloom();
+  }
+
+  ambushTimer += dt;
+  if (d.ambushChance > 0 && ambushTimer >= d.ambushInterval) {
+    ambushTimer = 0;
+    if (Math.random() < d.ambushChance) { spawnAmbush(); playAmbush(); }
+  }
+
+  for (const s of shapes) {
+    if (s.growing) {
+      const rate = d.shapeSpeed * dt;
+      s.w = Math.min(s.maxW, s.w + rate * (s.maxW / 180));
+      s.h = Math.min(s.maxH, s.h + rate * (s.maxH / 180));
+      if (s.w >= s.maxW && s.h >= s.maxH) s.growing = false;
+    }
+    const pf = Math.sin(t * s.pulseFreq + s.pulsePhase);
+    s.drawW = s.w * (1 + pf * s.pulseAmp);
+    s.drawH = s.h * (1 + pf * s.pulseAmp);
+  }
+
+  // ── Precise occupancy → score (progress toward filling the void) ──
+  occTimer += dt;
+  if (occTimer >= 110) { occTimer = 0; measureOccupancy(); }
+  progress = Math.min(1, occupancy / WIN_FILL);
+  score = Math.round(progress * 100);
+
+  // death takes precedence; otherwise reaching a full void is a WIN
+  if (playerCovered()) { triggerGameOver(); return; }
+  if (occupancy >= WIN_FILL) triggerWin();
+}
+
+// ─── Drawing primitives ───────────────────────────────────────────────────────
+function drawBg() {
+  const g = ctx.createRadialGradient(W * 0.5, H * 0.4, 0, W * 0.5, H * 0.52, Math.max(W, H) * 0.8);
+  g.addColorStop(0, '#f8f6f1');
+  g.addColorStop(0.6, '#f1ede6');
+  g.addColorStop(1, '#e7e1d8');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawGrain() {
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  ctx.fillStyle = grainPattern;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+// Organic liquid blob — draw each lobe at its animated drift & swell.
+function drawOrb(s, alpha, t) {
+  const Rx = (s.drawW || s.w) / 2, Ry = (s.drawH || s.h) / 2;
+  if (Rx <= 0.5 || Ry <= 0.5) return;
+  const Ravg = (Rx + Ry) / 2;
+  const sprite = s.pal.lobe;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  for (const l of s.lobes) {
+    const ox = l.ox + Math.sin(t * l.fxo + l.pxo) * l.axo;
+    const oy = l.oy + Math.sin(t * l.fyo + l.pyo) * l.ayo;
+    const rr = Math.max(0.05, l.rr + Math.sin(t * l.fr + l.pr) * l.ar);
+    const lx = s.x + ox * Rx, ly = s.y + oy * Ry;
+    const d = rr * Ravg * LOBE_PAD;
+    ctx.drawImage(sprite, lx - d, ly - d, d * 2, d * 2);
+  }
+  ctx.restore();
+}
+
+// Editorial label helper
+function label(text, x, y, size, color, align = 'left', spacing = '0.22em', weight = '500') {
+  ctx.font = `${weight} ${size}px 'Helvetica Neue', Helvetica, Arial, sans-serif`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'alphabetic';
+  ctx.letterSpacing = spacing;
+  ctx.fillText(text, x, y);
+  ctx.letterSpacing = '0em';
+}
+
+const pad4 = n => String(n).padStart(4, '0');
+function mmss(ms) {
+  const s = Math.floor(ms / 1000);
+  return String((s / 60) | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+function drawPlayer(x, y, extra = 0) {
+  const r = PLAYER_R + 0.4 * Math.sin(pulse) + extra;
+  // soft luminous halo so the dot reads on any colour
+  const h = ctx.createRadialGradient(x, y, 0, x, y, r + 9);
+  h.addColorStop(0, 'rgba(255,255,255,0.85)');
+  h.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+  h.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = h;
+  ctx.beginPath(); ctx.arc(x, y, r + 9, 0, Math.PI * 2); ctx.fill();
+  // dark core with subtle vertical shading
+  const core = ctx.createRadialGradient(x - r * 0.3, y - r * 0.3, 0, x, y, r);
+  core.addColorStop(0, '#4a4754');
+  core.addColorStop(1, '#1c1a24');
+  ctx.fillStyle = core;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+// ─── Corner chrome (editorial frame) ─────────────────────────────────────────--
+const INK = '#7c766c', INK_SOFT = '#a8a298', INK_FAINT = 'rgba(124,118,108,0.45)';
+function drawCorners(catalog) {
+  const m = Math.max(18, Math.min(W, H) * 0.05);
+  label('NEGATIVE SPACE', m, m + 4, 11, INK, 'left', '0.28em', '600');
+  label('— PERCEPTUAL SURVIVAL', m, m + 22, 9, INK_SOFT, 'left', '0.24em', '500');
+  label(catalog, W - m, m + 4, 11, INK, 'right', '0.24em', '600');
+  label('ORIGINAL MIX', W - m, m + 22, 9, INK_SOFT, 'right', '0.24em', '500');
+}
+
+// ─── Screens ───────────────────────────────────────────────────────────────--
+const heroOrb = { x: 0, y: 0, w: 0, h: 0, drawW: 0, drawH: 0, pal: COOL[0],
+                  lobes: makeLobes() };
+
+function drawIntro(t) {
+  drawBg();
+  // hero orb, breathing
+  const base = Math.min(W, H) * 0.32;
+  const pf = Math.sin(t * 0.0011);
+  heroOrb.x = W / 2; heroOrb.y = H * 0.43;
+  heroOrb.drawW = heroOrb.drawH = base * (1 + pf * 0.05);
+  drawOrb(heroOrb, 1, t);
+
+  drawCorners('NS — 000');
+
+  // title block (editorial, lower third)
+  ctx.textAlign = 'center';
+  label('NEGATIVE SPACE', W / 2, H * 0.74, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.3em', '700');
+  label('YOU EXIST ONLY IN WHAT REMAINS', W / 2, H * 0.74 + 26, Math.min(11, W * 0.026), INK_SOFT, 'center', '0.26em', '500');
+
+  // CTA
+  const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
+  ctx.globalAlpha = blink;
+  label('TAP TO BEGIN', W / 2, H * 0.86, Math.min(12, W * 0.028), '#3f3a33', 'center', '0.34em', '600');
+  ctx.globalAlpha = 1;
+
+  if (highScore > 0)
+    label('BEST  ' + highScore + '%', W / 2, H * 0.91, 10, INK_FAINT, 'center', '0.26em', '500');
+
+  drawGrain();
+}
+
+function drawGame(t) {
+  drawBg();
+  for (const s of shapes) drawOrb(s, 1, t);
+  drawPlayer(px, py);
+
+  const m = Math.max(18, Math.min(W, H) * 0.05);
+
+  // top-left branding
+  label('NEGATIVE SPACE', m, m + 4, 11, INK, 'left', '0.28em', '600');
+  label('— PERCEPTUAL SURVIVAL', m, m + 22, 9, INK_SOFT, 'left', '0.24em', '500');
+
+  // top-right — big % of the void survived (the score)
+  label('SPACE SURVIVED', W - m, m + 2, 9, INK_SOFT, 'right', '0.24em', '500');
+  label(score + '%', W - m, m + 36, Math.min(32, W * 0.064), '#3f3a33', 'right', '0.02em', '700');
+
+  // bottom — precise progress bar toward a full void (100% = win)
+  const barX = m, barW = W - m * 2, barY = H - m - 5, barH = 4;
+  label('THE VOID', barX, barY - 11, 9, INK_SOFT, 'left', '0.26em', '500');
+  label(score + '% / 100%   ·   ' + mmss(elapsed), barX + barW, barY - 11, 9, INK_SOFT, 'right', '0.26em', '500');
+  ctx.fillStyle = INK_FAINT;
+  ctx.fillRect(barX, barY, barW, barH);
+  ctx.fillStyle = '#3f3a33';
+  ctx.fillRect(barX, barY, barW * progress, barH);
+  // leading edge marker
+  ctx.fillStyle = '#3f3a33';
+  ctx.fillRect(barX + barW * progress - 1, barY - 3, 2, barH + 6);
+
+  drawGrain();
+}
+
+function drawOver(t) {
+  // frozen scene
+  drawBg();
+  for (const s of shapes) drawOrb(s, 1, t);
+
+  // warm veil settles over the scene
+  overAlpha = Math.min(1, overAlpha + 0.018);
+  ctx.fillStyle = `rgba(241,237,230,${overAlpha * 0.86})`;
+  ctx.fillRect(0, 0, W, H);
+
+  // a final bloom where the player was consumed
+  if (overAlpha < 0.9) {
+    const bloomR = overAlpha * Math.max(W, H) * 0.18;
+    drawOrb({ x: deathX, y: deathY, drawW: bloomR * 2, drawH: bloomR * 2,
+              pal: deathPal, lobes: deathLobes }, (1 - overAlpha) * 0.9, t);
+  }
+
+  drawGrain();
+  if (overAlpha < 0.35) return;
+  const a = Math.min(1, (overAlpha - 0.35) / 0.4);
+  ctx.globalAlpha = a;
+
+  label('CONSUMED', W / 2, H * 0.40, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.32em', '700');
+  label('SPACE SURVIVED', W / 2, H * 0.49, 10, INK_SOFT, 'center', '0.3em', '500');
+  label(score + '%', W / 2, H * 0.49 + 40, Math.min(44, W * 0.092), '#3f3a33', 'center', '0.02em', '700');
+  label('IN ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.26em', '500');
+
+  label(score >= highScore ? 'NEW BEST' : 'BEST  ' + highScore + '%',
+        W / 2, H * 0.67, 10, score >= highScore ? '#3f3a33' : INK_FAINT, 'center', '0.28em', '600');
+
+  const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
+  ctx.globalAlpha = a * blink;
+  label('TAP TO TRY AGAIN', W / 2, H * 0.79, Math.min(12, W * 0.028), '#3f3a33', 'center', '0.32em', '600');
+  ctx.globalAlpha = 1;
+}
+
+// ─── Success screen ──────────────────────────────────────────────────────────
+function drawWin(t) {
+  drawBg();
+  for (const s of shapes) drawOrb(s, 1, t);
+
+  // light luminous veil fills in — the void becomes whole, calm, complete
+  winAlpha = Math.min(1, winAlpha + 0.014);
+  ctx.fillStyle = `rgba(248,246,241,${winAlpha * 0.82})`;
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrain();
+  if (winAlpha < 0.35) return;
+  const a = Math.min(1, (winAlpha - 0.35) / 0.45);
+  ctx.globalAlpha = a;
+
+  label('COMPLETE', W / 2, H * 0.39, Math.min(36, W * 0.076), '#3f3a33', 'center', '0.34em', '700');
+  label('YOU SURVIVED THE FULL VOID', W / 2, H * 0.48, 10, INK_SOFT, 'center', '0.3em', '500');
+  label('100%', W / 2, H * 0.48 + 46, Math.min(50, W * 0.105), '#c79a3a', 'center', '0.02em', '700'); // gold
+  label('IN ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.26em', '500');
+
+  const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
+  ctx.globalAlpha = a * blink;
+  label('TAP TO PLAY AGAIN', W / 2, H * 0.78, Math.min(12, W * 0.028), '#3f3a33', 'center', '0.32em', '600');
+  ctx.globalAlpha = 1;
+}
+
+// ─── Loop ──────────────────────────────────────────────────────────────────--
+function loop(t) {
+  update(t);
+  if      (state === 'intro')   drawIntro(t);
+  else if (state === 'playing') drawGame(t);
+  else if (state === 'won')     drawWin(t);
+  else                          drawOver(t);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(t => { lastT = t; requestAnimationFrame(loop); });
+
+})();
+</script>
+</body>
+</html>
