@@ -22,10 +22,54 @@ canvas {
   top: 0; left: 0;
   width: 100%; height: 100%;
 }
+/* Name capture overlay — transparent so the canvas grain shows through */
+/* Name prompt — floats over the death screen, no panel/box, no backdrop */
+#nameOv {
+  position: fixed; inset: 0; z-index: 20;
+  display: none; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+#nameOv.show { display: flex; pointer-events: auto; }
+#nameOv .card {
+  display: flex; flex-direction: column; align-items: center; gap: 24px;
+}
+#nameOv .q {
+  font: 500 11px 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  letter-spacing: 0.3em; color: #a8a298; text-transform: uppercase;
+  padding-top: 48px;
+}
+#nameInput {
+  background: transparent; border: none; border-bottom: 1.5px solid #8a857c;
+  color: #3f3a33; text-align: center; text-transform: uppercase; outline: none;
+  font: 700 34px 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  letter-spacing: 0.04em; padding: 6px 6px; width: min(70vw, 320px);
+}
+#nameInput:focus { border-bottom-color: #3f3a33; }
+#nameOv .row { display: flex; align-items: baseline; gap: 28px; }
+#saveBtn {
+  background: transparent; border: none; cursor: pointer; padding: 6px 2px;
+  color: #3f3a33; text-transform: uppercase;
+  font: 600 12px 'Helvetica Neue', Helvetica, Arial, sans-serif; letter-spacing: 0.28em;
+}
+#skipBtn {
+  background: transparent; border: none; cursor: pointer; padding: 6px 2px;
+  color: #a8a298; text-transform: uppercase;
+  font: 600 12px 'Helvetica Neue', Helvetica, Arial, sans-serif; letter-spacing: 0.28em;
+}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="nameOv">
+  <div class="card">
+    <div class="q">What's your name?</div>
+    <input id="nameInput" maxlength="16" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+    <div class="row">
+      <button id="saveBtn">Save →</button>
+      <button id="skipBtn">skip</button>
+    </div>
+  </div>
+</div>
 <script>
 (() => {
 'use strict';
@@ -133,15 +177,47 @@ grain.width = grain.height = 180;
 const grainPattern = ctx.createPattern(grain, 'repeat');
 
 // ─── State ───────────────────────────────────────────────────────────────────
-let state = 'intro';                                  // intro | playing | over | won
+let state = 'intro';                    // intro | onboard | playing | over | won | board
 let highScore = +localStorage.getItem('ns_nerve') || 0; // best NERVE
 let elapsed = 0;
+
+// ─── Leaderboard backend (Supabase REST) ─────────────────────────────────────
+const SB_URL = 'https://fmkhgkkwhvjgmsidlkqv.supabase.co';
+const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZta2hna2t3aHZqZ21zaWRsa3F2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4NjA5NjIsImV4cCI6MjA5ODQzNjk2Mn0.HakHFZbLpuQpdHZZYPRqZerb9NlancMBosJaelxjo24';
+const SB_H = { apikey: SB_KEY, Authorization: 'Bearer ' + SB_KEY };
+
+// onboarding / player identity
+let sessions = +localStorage.getItem('nerve_sessions') || 0;
+let playerName = localStorage.getItem('nerve_player_name') || '';
+let namePrompt = false, pendingScore = 0;
+// non-interactive onboarding: one scripted, illustrative sequence
+let obT = 0, obBlobsSpawned = false, obPulsed = false;
+
+// leaderboard
+let boardRows = null, boardFrom = 'intro', boardMe = null;
+// tap targets recorded during draw
+let linkIntroBoard = null, linkOverBoard = null, linkOverClose = null;
 
 // ─── Risk–reward: NERVE is the score, earned only by grazing danger ──────────--
 // graze = proximity to nearest ink (0 far → 1 touching); it drives a multiplier
 // and the rate you bank NERVE. Hugging the ink is where the points are.
-let nerve = 0, mult = 1, graze = 0;
+let nerve = 0, mult = 1, graze = 0, scoreTick = 0;
 const DANGER_BAND = 82, MAX_MULT = 5;
+// high-score moment: best-to-beat snapshotted at game start; fires once when passed
+let runStartBest = 0, hiTriggered = false, hiPulseStart = -9999;
+const sstep = x => x * x * (3 - 2 * x);
+
+// ─── PULSE mechanic ───────────────────────────────────────────────────────────
+// SPACE pushes all blobs away for ~3s, then they drift home. 3 uses per game.
+const PULSE_USES = 3, PULSE_MAX = 240;
+let pulseUses = PULSE_USES, pulseActive = false, pulseElapsed = 0;
+// one-time "SPACE TO PULSE" hint on the first critical near-miss (persisted)
+let hintShown = !!localStorage.getItem('nerve_pulsehint'), hintStart = -9999;
+let ringActive = false, ringT = 0, ringX = 0, ringY = 0; // expanding wave visual
+const pulseIcons = [0, 1, 2].map(i => ({ pal: COOL[i % COOL.length], lobes: makeLobes(0.4), a: 1 }));
+
+// intro screen — dots that fade in/out at random spots (world is already alive)
+let introDots = [], introNextSpawn = 0;
 const motes = [];          // collectible glints that sit in the risky gaps
 let moteTimer = 0, collected = 0, moteSpawnCount = 0, reachTimer = 0;
 const MOTE_MSGS = ['COLLECT ME', 'CATCH ME', 'OVER HERE', 'GRAB ME'];
@@ -181,18 +257,167 @@ canvas.addEventListener('mousemove',  onPointerMove);
 canvas.addEventListener('touchmove',  onPointerMove, { passive: true });
 canvas.addEventListener('touchstart', onPointerMove, { passive: true });
 canvas.addEventListener('touchend',   onPointerEnd);
-canvas.addEventListener('click', handleTap);
+function toCanvas(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  return [(clientX - r.left) * (W / r.width), (clientY - r.top) * (H / r.height)];
+}
+canvas.addEventListener('click', e => onTap(...toCanvas(e.clientX, e.clientY)));
 let lastTouchEnd = 0;
 canvas.addEventListener('touchend', e => {
   if (!e.changedTouches.length) return;
   const now = Date.now();
   if (now - lastTouchEnd < 300) return;
   lastTouchEnd = now;
-  handleTap();
+  onTap(...toCanvas(e.changedTouches[0].clientX, e.changedTouches[0].clientY));
 }, { passive: true });
-function handleTap() {
-  if (state === 'intro' || state === 'over' || state === 'won') startGame();
+
+const inRect = (x, y, r) => r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+
+// SPACE fires a pulse during play (if uses remain)
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault();
+    if (state === 'playing') firePulse();
+  }
+});
+function firePulse() {
+  if (pulseUses <= 0) return;
+  pulseUses--;
+  playPulse();
+  pulseActive = true; pulseElapsed = 0;
+  ringActive = true; ringT = 0; ringX = px; ringY = py;
+  for (const s of shapes) {                 // capture an outward push dir per blob
+    const hx = s.homeX ?? s.x, hy = s.homeY ?? s.y;
+    let dx = hx - px, dy = hy - py, d = Math.hypot(dx, dy) || 1;
+    s.pushDX = dx / d * PULSE_MAX; s.pushDY = dy / d * PULSE_MAX;
+  }
 }
+
+function onTap(cx, cy) {
+  if (namePrompt) return;                 // DOM overlay handles its own clicks
+  if (state === 'board') { closeBoard(); return; }
+  if (state === 'intro') {
+    if (inRect(cx, cy, linkIntroBoard)) { openBoard('intro'); return; }
+    beginFromIntro(); return;
+  }
+  if (state === 'over') {
+    if (inRect(cx, cy, linkOverClose)) { state = 'intro'; return; }
+    if (inRect(cx, cy, linkOverBoard)) { openBoard('over'); return; }
+    startGame(); return;
+  }
+  if (state === 'won') startGame();
+}
+
+// First taps of a fresh player get the onboarding sequence, then the game.
+function beginFromIntro() {
+  ensureAudio();
+  if (sessions < 2) startOnboarding();
+  else startGame();
+}
+
+// ─── Non-interactive onboarding — one scripted, illustrative sequence ────────
+// 0–2100  COLLECT DOTS (dot appears)   2100–4200  AVOID BLOBS (blobs drift in)
+// 4200–6300  SPACE TO PULSE (wave; blobs pushed out)   6300–8100  HOW LONG… → game
+function startOnboarding() {
+  state = 'onboard';
+  obT = 0; obBlobsSpawned = false; obPulsed = false; ringActive = false;
+  shapes.length = 0; floats.length = 0;
+  motes.length = 0; motes.push({ x: W / 2, y: H / 2, life: 1e9, msg: null }); // the dot
+}
+function spawnObBlobs() {
+  shapes.length = 0;
+  const cx = W / 2, cy = H / 2, n = 2 + (Math.random() * 2 | 0);
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU + Math.random() * 0.6, d = Math.min(W, H) * 0.36;
+    const maxDim = 170 + Math.random() * 80;
+    const s = makeShape(cx + Math.cos(a) * d, cy + Math.sin(a) * d, maxDim, maxDim / (0.7 + Math.random() * 0.6), Math.random() < 0.5);
+    s.w = s.maxW; s.h = s.maxH; s.growing = false;     // full size — illustrative only
+    shapes.push(s);
+  }
+}
+function updateOnboard(dt, t) {
+  obT += dt;
+  const cx = W / 2, cy = H / 2;
+  const breathe = s => { const pf = Math.sin(t * s.pulseFreq + s.pulsePhase); s.drawW = s.w * (1 + pf * s.pulseAmp); s.drawH = s.h * (1 + pf * s.pulseAmp); };
+  if (obT >= 2100 && !obBlobsSpawned) { obBlobsSpawned = true; spawnObBlobs(); }
+  if (obT >= 4200 && !obPulsed) { obPulsed = true; ringActive = true; ringT = 0; ringX = cx; ringY = cy; }
+  if (ringActive) { ringT += dt; if (ringT > 600) ringActive = false; }
+  for (const s of shapes) {
+    if (obT < 4200) {                                  // drift toward the dot
+      const k = Math.min(1, dt * 0.0007);
+      s.x += (cx - s.x) * k; s.y += (cy - s.y) * k;
+    } else {                                           // pushed away by the wave
+      const dx = s.x - cx, dy = s.y - cy, d = Math.hypot(dx, dy) || 1;
+      s.x += dx / d * dt * 0.06; s.y += dy / d * dt * 0.06;
+    }
+    breathe(s);
+  }
+  if (obT >= 8100) startGame();                        // seamless handoff into the game
+}
+
+// ─── Leaderboard backend calls ────────────────────────────────────────────────
+async function submitScore(name, score) {
+  try {
+    const q = SB_URL + '/rest/v1/scores?name=eq.' + encodeURIComponent(name) + '&select=id,score';
+    const rows = await (await fetch(q, { headers: SB_H })).json();
+    if (Array.isArray(rows) && rows.length) {
+      if (score > rows[0].score) {
+        await fetch(SB_URL + '/rest/v1/scores?id=eq.' + rows[0].id, {
+          method: 'PATCH', headers: { ...SB_H, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+          body: JSON.stringify({ score, updated_at: new Date().toISOString() }),
+        });
+      }
+    } else {
+      await fetch(SB_URL + '/rest/v1/scores', {
+        method: 'POST', headers: { ...SB_H, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ name, score, updated_at: new Date().toISOString() }),
+      });
+    }
+  } catch (e) { /* offline — silently skip */ }
+}
+async function openBoard(from) {
+  boardFrom = from; boardRows = null; boardMe = null; state = 'board';
+  try {
+    const q = SB_URL + '/rest/v1/scores?select=name,score&order=score.desc&limit=10';
+    const rows = await (await fetch(q, { headers: SB_H })).json();
+    boardRows = Array.isArray(rows) ? rows : [];
+    // if the player isn't in the top 10, find their score + true rank
+    if (playerName && !boardRows.some(r => (r.name || '').toUpperCase() === playerName.toUpperCase())) {
+      const me = await (await fetch(SB_URL + '/rest/v1/scores?select=score&name=eq.' + encodeURIComponent(playerName), { headers: SB_H })).json();
+      if (Array.isArray(me) && me.length) {
+        const scr = me[0].score;
+        const cr = await fetch(SB_URL + '/rest/v1/scores?select=id&score=gt.' + scr, { headers: { ...SB_H, Prefer: 'count=exact', Range: '0-0' } });
+        const range = cr.headers.get('content-range'); // "0-0/COUNT"
+        const higher = range ? parseInt(range.split('/')[1]) : 0;
+        boardMe = { name: playerName, score: scr, rank: higher + 1 };
+      }
+    }
+  } catch (e) { boardRows = []; }
+}
+function closeBoard() { state = 'intro'; } // closing any overlay returns to intro
+
+// ─── Name capture overlay (DOM) ───────────────────────────────────────────────
+const nameOv = document.getElementById('nameOv');
+const nameInput = document.getElementById('nameInput');
+const saveBtn = document.getElementById('saveBtn');
+function showNamePrompt(score) {
+  if (state !== 'over') return;
+  pendingScore = score; namePrompt = true;
+  nameInput.value = ''; nameOv.classList.add('show');
+  setTimeout(() => nameInput.focus(), 60);
+}
+function hideNamePrompt() { namePrompt = false; nameOv.classList.remove('show'); }
+async function doSave() {
+  const v = nameInput.value.trim();
+  hideNamePrompt();
+  if (!v) return;                         // skipped: don't submit, don't nag again
+  playerName = v; localStorage.setItem('nerve_player_name', v);
+  await submitScore(v, pendingScore);
+  openBoard('over');                      // straight to the leaderboard after saving
+}
+saveBtn.addEventListener('click', doSave);
+document.getElementById('skipBtn').addEventListener('click', hideNamePrompt); // skip: no submit
+nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSave(); });
 
 // ─── Audio (soft synth pads) ──────────────────────────────────────────────────
 let audioCtx = null;
@@ -269,6 +494,41 @@ function playWin() {
 // MOTE pickup — a bright little chime, same bloom family, pitched up.
 const playMote = () => { bloomNote(1175, 0, 0.3, 0.05); bloomNote(1568, 0.02, 0.28, 0.03); };
 
+// HIGH SCORE — the ONLY sound in the game. A soft sine bell: quiet acknowledgment.
+function playHighScore() {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.type = 'sine'; o.frequency.value = 880;
+  const t0 = audioCtx.currentTime;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(0.3, t0 + 0.02);        // attack 20ms → peak 0.3
+  g.gain.setValueAtTime(0.3, t0 + 0.12);                 // sustain 100ms
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6); // release ~480ms
+  o.start(t0); o.stop(t0 + 0.62);
+}
+
+// PULSE activation — light and airy: a soft high shimmer that swells outward and
+// fades. Gentle upward lift (opening, not bouncing), pure sines, no resonance.
+function playPulse() {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime, END = 0.6;
+  const master = audioCtx.createGain();
+  master.connect(audioCtx.destination);
+  master.gain.setValueAtTime(0.0001, t0);
+  master.gain.linearRampToValueAtTime(0.18, t0 + 0.04);        // soft swell
+  master.gain.exponentialRampToValueAtTime(0.0001, t0 + END);  // light fade
+  // an airy chord with a whisper of upward glide — feels like opening outward
+  [[523, 0.5], [784, 0.30], [1046, 0.12]].forEach(([f, amp]) => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(f, t0);
+    o.frequency.linearRampToValueAtTime(f * 1.06, t0 + END);   // slight lift
+    g.gain.value = amp; o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + END + 0.05);
+  });
+}
+
 // ─── Difficulty ───────────────────────────────────────────────────────────────
 function difficulty() {
   const t = elapsed / 1000;
@@ -291,7 +551,7 @@ function makeShape(x, y, maxW, maxH, hot) {
   const sf = Math.min(2.2, maxW / 250); // size factor — bigger blobs are more alive
   return {
     // start at a visible fraction so the blob POPS into being, then keeps growing
-    x, y, w: maxW * 0.22, h: maxH * 0.22, maxW, maxH,
+    x, y, homeX: x, homeY: y, w: maxW * 0.22, h: maxH * 0.22, maxW, maxH,
     growing: true,
     pal,
     lobes: makeLobes(sf),
@@ -444,9 +704,14 @@ function ensureReachableMote() {
 // ─── Start / restart ──────────────────────────────────────────────────────────
 function startGame() {
   ensureAudio();
+  hideNamePrompt();
+  sessions++; localStorage.setItem('nerve_sessions', sessions);
   playStart();
   state = 'playing';
-  nerve = 0; mult = 1; graze = 0; elapsed = 0;
+  nerve = 0; mult = 1; graze = 0; scoreTick = 0; elapsed = 0;
+  runStartBest = highScore; hiTriggered = false; hiPulseStart = -9999;
+  pulseUses = PULSE_USES; pulseActive = false; pulseElapsed = 0; ringActive = false;
+  pulseIcons.forEach(ic => ic.a = 1);
   motes.length = 0; moteTimer = 0; collected = 0; moteSpawnCount = 0; reachTimer = 0;
   floats.length = 0;
   spawnTimer = -300; ambushTimer = 0; nextSpawn = 600;
@@ -495,7 +760,12 @@ function triggerGameOver() {
     if (ex*ex + ey*ey <= 1) { deathPal = s.pal; deathLobes = s.lobes; break; }
   }
   overAlpha = 0;
+  const finalScore = Math.round(nerve);
   saveBest();
+  // submit if we know who you are; otherwise ask for a name — only after the
+  // very first game ever (the name modal never nags again after that)
+  if (playerName) submitScore(playerName, finalScore);
+  else if (sessions === 1) setTimeout(() => showNamePrompt(finalScore), 800);
   playGameOver();
 }
 
@@ -510,6 +780,7 @@ function triggerWin() {
   winAlpha = 0;
   nerve += 250; // completion bonus for filling the void
   saveBest();
+  if (playerName) submitScore(playerName, Math.round(nerve));
   playWin();
 }
 
@@ -519,6 +790,7 @@ function update(t) {
   const dt = Math.min(t - lastT, 80);
   lastT = t;
   pulse += dt * 0.004;
+  if (state === 'onboard') { updateOnboard(dt, t); return; }
   if (state !== 'playing') return;
 
   elapsed += dt;
@@ -570,17 +842,50 @@ function update(t) {
     s.drawH = s.h * (1 + pf * s.pulseAmp);
   }
 
-  // ── Proximity → multiplier (the closer to ink, the more a dot is worth) ──
-  const gap = gapAt(px, py);
-  graze = gap < DANGER_BAND ? Math.max(0, 1 - Math.max(0, gap) / DANGER_BAND) : 0;
-  const target = 1 + graze * (MAX_MULT - 1);
-  mult += (target - mult) * Math.min(1, dt * (target > mult ? 0.012 : 0.004));
-  if (mult < 1) mult = 1;
+  // ── PULSE: displace blobs outward, hold ~3s, then drift home (amt eases to 0) ──
+  if (ringActive) { ringT += dt; if (ringT > 600) ringActive = false; }
+  // icons fade: the used ones ease down toward ~18% opacity
+  const used = PULSE_USES - pulseUses;
+  for (let i = 0; i < pulseIcons.length; i++) {
+    const tgt = i < used ? 0.18 : 1;
+    pulseIcons[i].a += (tgt - pulseIcons[i].a) * Math.min(1, dt * 0.006);
+  }
+  if (pulseActive) {
+    pulseElapsed += dt;
+    const tt = pulseElapsed;
+    let amt;
+    if (tt < 250) amt = sstep(tt / 250);            // wave hits
+    else if (tt < 3250) amt = 1;                    // hold away ~3s
+    else if (tt < 5750) amt = 1 - sstep((tt - 3250) / 2500); // drift home
+    else { amt = 0; pulseActive = false; }
+    for (const s of shapes) {
+      const hx = s.homeX ?? s.x, hy = s.homeY ?? s.y;
+      if (s.pushDX === undefined) {                 // blob spawned mid-pulse — give it a dir
+        let dx = hx - px, dy = hy - py, d = Math.hypot(dx, dy) || 1;
+        s.pushDX = dx / d * PULSE_MAX; s.pushDY = dy / d * PULSE_MAX;
+      }
+      s.x = hx + s.pushDX * amt; s.y = hy + s.pushDY * amt;
+    }
+    if (!pulseActive) for (const s of shapes) { s.x = s.homeX ?? s.x; s.y = s.homeY ?? s.y; s.pushDX = s.pushDY = undefined; }
+  }
 
-  // NERVE: a small trickle for surviving, but it climbs FAST the closer you hug
-  // the ink — risk pays continuously, scaled by the live multiplier (not just on
-  // pickups). Collecting dots is still the big burst payoff (40 × mult).
-  nerve += dt / 1000 * (2 + graze * mult * 6);
+  // proximity is still used for the player's danger glow (not for scoring)
+  const gap = gapAt(px, py);
+  // first critical near-miss ever → one-time SPACE TO PULSE hint
+  if (!hintShown && gap < 10) {
+    hintShown = true; hintStart = elapsed; localStorage.setItem('nerve_pulsehint', '1');
+  }
+  graze = gap < DANGER_BAND ? Math.max(0, 1 - Math.max(0, gap) / DANGER_BAND) : 0;
+
+  // ── SCORE: multiplier = 1 + 0.1 per dot; each second adds (multiplier × 10) ──
+  mult = 1 + 0.1 * collected;
+  scoreTick += dt;
+  while (scoreTick >= 1000) { scoreTick -= 1000; nerve += mult * 10; }
+
+  // high-score moment — fires once, the instant you pass a real prior best
+  if (!hiTriggered && runStartBest > 0 && Math.round(nerve) > runStartBest) {
+    hiTriggered = true; hiPulseStart = elapsed; playHighScore();
+  }
 
   // ── Motes: the collectibles. They sit in risky gaps; worth more the closer
   //    to the ink you grab them (current multiplier). ──
@@ -593,10 +898,8 @@ function update(t) {
     const mo = motes[i];
     mo.life -= dt;
     if (Math.hypot(px - mo.x, py - mo.y) < 18) {       // collected (hover over it)
-      const gained = Math.round(40 * mult);
-      nerve += gained;
-      collected++;
-      addFloat(mo.x, mo.y, '+' + gained, 'rgba(199,154,58,A)', 16);
+      collected++;                                      // raises the multiplier (+0.1)
+      addFloat(mo.x, mo.y, '+0.1×', 'rgba(199,154,58,A)', 15);
       motes.splice(i, 1); playMote();
     } else if (mo.life <= 0 || pointCovered(mo.x, mo.y)) {
       motes.splice(i, 1);                              // expired or swallowed by ink
@@ -709,13 +1012,13 @@ function drawIntro(t) {
   drawBg();
   ctx.textAlign = 'center';
 
-  // ── Title + tagline, above the blob ──
+  // ── Title + instruction lines, above the blob ──
   const tSize = Math.min(70, W * 0.135);
+  const iy = H * 0.16 + tSize * 0.6, isz = Math.min(11, W * 0.024);
   label('NERVE', W / 2, H * 0.16, tSize, '#3f3a33', 'center', '0.4em', '700');
-  label('COLLECT DOTS.  AVOID BLOBS.', W / 2, H * 0.16 + tSize * 0.6,
-        Math.min(11, W * 0.024), INK_SOFT, 'center', '0.42em', '500');
+  label('COLLECT DOTS.  AVOID BLOBS.', W / 2, iy, isz, INK_SOFT, 'center', '0.42em', '500');
 
-  // ── Hero blob (atmospheric) — breathing + colour drift, collectible dot at heart ──
+  // ── Hero blob (atmospheric) — breathing + colour drift ──
   const base = Math.min(W, H) * 0.30;
   const pf = Math.sin(t * 0.0011);
   heroOrb.x = W / 2; heroOrb.y = H * 0.48;
@@ -725,13 +1028,30 @@ function drawIntro(t) {
   const f = span - Math.floor(span), e = f * f * (3 - 2 * f); // smoothstep crossfade
   heroOrb.pal = HERO_CYCLE[i0]; drawOrb(heroOrb, 1 - e, t);
   heroOrb.pal = HERO_CYCLE[i1]; drawOrb(heroOrb, e, t);
-  drawMote({ x: heroOrb.x, y: heroOrb.y, life: 9999, msg: null }, t);
+
+  // ── Ambient dots — fade in/out at random spots; the world is already alive ──
+  if (t >= introNextSpawn && introDots.length < 3) {
+    const bandTop = H * 0.28, bandBot = H * 0.74;
+    introDots.push({ x: W * 0.08 + Math.random() * W * 0.84, y: bandTop + Math.random() * (bandBot - bandTop), born: t });
+    introNextSpawn = t + (introDots.length < 2 ? 300 : 800 + Math.random() * 700);
+  }
+  for (let i = introDots.length - 1; i >= 0; i--) {
+    const dt2 = t - introDots[i].born;
+    if (dt2 > 2800) { introDots.splice(i, 1); continue; }
+    let da = 1;
+    if (dt2 < 800) da = dt2 / 800;
+    else if (dt2 > 2000) da = 1 - (dt2 - 2000) / 800;
+    ctx.globalAlpha = Math.max(0, da);
+    drawMote({ x: introDots[i].x, y: introDots[i].y, life: 9999, msg: null }, t);
+    ctx.globalAlpha = 1;
+  }
 
   // ── CTA — detached, below the blob, the last thing you read ──
   const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
   ctx.globalAlpha = blink;
   label('TAP TO BEGIN', W / 2, H * 0.82, Math.min(12, W * 0.026), '#3f3a33', 'center', '0.44em', '600');
   ctx.globalAlpha = 1;
+  linkIntroBoard = null;
 
   drawGrain();
 }
@@ -774,6 +1094,13 @@ function drawFloats() {
   ctx.letterSpacing = '0em';
 }
 
+// Unified close button — one × top-right on every overlay. Returns its tap rect.
+function drawCloseX() {
+  const m = Math.max(18, Math.min(W, H) * 0.05);
+  label('×', W - m, m + 24, 26, INK, 'right', '0em', '400');
+  return { x: W - m - 42, y: m - 4, w: 54, h: 54 };
+}
+
 function drawGame(t) {
   drawBg();
   for (const s of shapes) drawOrb(s, 1, t);
@@ -789,32 +1116,56 @@ function drawGame(t) {
     if (w > 0.4) { ctx.textAlign = 'center'; label('MOVE', px, py - rr - 8, 9, `rgba(214,74,86,${w})`, 'center', '0.3em', '700'); }
   }
 
+  // pulse wave — one clean expanding ring, warm gold like the collectible dots
+  if (ringActive) {
+    const k = ringT / 600, r = 300 * sstep(k);
+    ctx.strokeStyle = `rgba(244,176,86,${0.4 * (1 - k)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(ringX, ringY, r, 0, Math.PI * 2); ctx.stroke();
+  }
+
   drawPlayer(px, py, 0, graze);
   drawFloats();
 
   const m = Math.max(18, Math.min(W, H) * 0.05);
 
-  // top-left branding — single line: bold name, then muted tagline
-  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-  ctx.font = "600 11px 'Helvetica Neue', Helvetica, Arial, sans-serif";
-  ctx.letterSpacing = '0.28em';
-  ctx.fillStyle = INK;
-  ctx.fillText('NERVE', m, m + 8);
-  const nameW = ctx.measureText('NERVE').width;
-  ctx.font = "500 9px 'Helvetica Neue', Helvetica, Arial, sans-serif";
-  ctx.letterSpacing = '0.24em';
-  ctx.fillStyle = INK_SOFT;
-  ctx.fillText('—  COLLECT DOTS.  AVOID BLOBS.', m + nameW + 14, m + 8);
-  ctx.letterSpacing = '0em';
+  // top-right — current score is the hero; BEST is a quiet reference beneath it
+  // (until you pass it, when it disappears). Multiplier still runs, just not shown.
+  let sc = 1; const pt = elapsed - hiPulseStart;   // high-score pulse: 100→115→100%
+  if (pt >= 0 && pt < 200) { const k = pt / 200; sc = 1 + 0.15 * (k * k * (3 - 2 * k)); }
+  else if (pt >= 200 && pt < 500) { const k = (pt - 200) / 300; sc = 1.15 - 0.15 * (k * k * (3 - 2 * k)); }
+  label(Math.round(nerve).toString(), W - m, m + 40, Math.min(40, W * 0.078) * sc, '#3f3a33', 'right', '0.02em', '700');
+  let ny = m + 62;
+  if (runStartBest > 0 && Math.round(nerve) <= runStartBest) {
+    label('BEST  ' + runStartBest, W - m, ny, 9, INK_SOFT, 'right', '0.24em', '500'); ny += 20;
+  }
 
-  // top-right — NERVE (the score) + live multiplier, hotter the closer you fly
-  label('SCORE', W - m, m + 2, 9, INK_SOFT, 'right', '0.24em', '500');
-  label(Math.round(nerve).toString(), W - m, m + 36, Math.min(32, W * 0.064), '#3f3a33', 'right', '0.02em', '700');
-  const cr = (63 + (240 - 63) * graze) | 0, cg = (58 + (86 - 58) * graze) | 0, cb = (51 + (96 - 51) * graze) | 0;
-  label('×' + mult.toFixed(1), W - m, m + 56, 13, `rgb(${cr},${cg},${cb})`, 'right', '0.06em', '700');
+  // pulse charges — three warm-gold dots below the score
+  const dotY = ny + 4;
+  for (let i = 0; i < 3; i++) {
+    const dx = W - m - (2 - i) * 16;
+    const gl = Math.max(0, (pulseIcons[i].a - 0.18) / 0.82); // 1 active → 0 used (no glow)
+    const g = ctx.createRadialGradient(dx, dotY, 0, dx, dotY, 9);
+    g.addColorStop(0,   `rgba(255,206,110,${0.95 * gl})`);
+    g.addColorStop(0.5, `rgba(244,176,86,${0.4 * gl})`);
+    g.addColorStop(1,   'rgba(244,176,86,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(dx, dotY, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgba(120,85,35,${0.2 + 0.6 * gl})`;
+    ctx.beginPath(); ctx.arc(dx, dotY, 2, 0, Math.PI * 2); ctx.fill();
+  }
 
   // bottom-left — quiet survival clock
   label(mmss(elapsed), m, H - m, 12, INK_SOFT, 'left', '0.12em', '600');
+
+  // one-time critical-moment hint — centered near the bottom
+  const ht = elapsed - hintStart;
+  if (ht >= 0 && ht < 2600) {
+    const ha = ht < 300 ? ht / 300 : ht > 2300 ? 1 - (ht - 2300) / 300 : 1;
+    ctx.globalAlpha = Math.max(0, ha);
+    label('SPACE TO PULSE', W / 2, H * 0.9, Math.min(11, W * 0.024), INK_SOFT, 'center', '0.34em', '600');
+    ctx.globalAlpha = 1;
+  }
 
   drawGrain();
 }
@@ -841,18 +1192,47 @@ function drawOver(t) {
   const a = Math.min(1, (overAlpha - 0.35) / 0.4);
   ctx.globalAlpha = a;
 
-  const nv = Math.round(nerve), best = nv >= highScore;
-  label('GONE', W / 2, H * 0.40, Math.min(34, W * 0.072), '#3f3a33', 'center', '0.32em', '700');
-  label('SCORE', W / 2, H * 0.49, 10, INK_SOFT, 'center', '0.3em', '500');
-  label(nv.toString(), W / 2, H * 0.49 + 40, Math.min(44, W * 0.092), '#3f3a33', 'center', '0.02em', '700');
-  label(collected + ' DOTS  ·  SURVIVED ' + mmss(elapsed), W / 2, H * 0.61, 10, INK_FAINT, 'center', '0.24em', '500');
+  // Permanent, clean death screen — name capture is a separate modal on top.
+  const nv = Math.round(nerve), cx = W / 2;
+  const newBest = runStartBest > 0 && nv > runStartBest;   // beat a real prior best
+  ctx.globalAlpha = a;
 
-  label(best ? 'NEW BEST' : 'BEST SCORE  ' + highScore,
-        W / 2, H * 0.67, 10, best ? '#3f3a33' : INK_FAINT, 'center', '0.28em', '600');
+  label('CAUGHT', cx, H * 0.24, Math.min(49, W * 0.103), '#3f3a33', 'center', '0.32em', '700');
 
-  const blink = 0.55 + 0.45 * Math.sin(t * 0.0024);
-  ctx.globalAlpha = a * blink;
-  label('TAP TO TRY AGAIN', W / 2, H * 0.79, Math.min(12, W * 0.028), '#3f3a33', 'center', '0.32em', '600');
+  // while the floating name prompt is up, it owns the centre. Show CAUGHT, and —
+  // only if this run beat the previous best — a NEW BEST block above the prompt.
+  if (namePrompt) {
+    linkOverBoard = linkOverClose = null;
+    if (nv > runStartBest) {
+      label('NEW BEST', cx, H * 0.34, 10, INK_SOFT, 'center', '0.34em', '600');
+      label(String(nv), cx, H * 0.34 + 46, Math.min(42, W * 0.09), '#3f3a33', 'center', '0.02em', '700');
+    }
+    ctx.globalAlpha = 1; return;
+  }
+
+  if (newBest) label('NEW BEST', cx, H * 0.45, 10, INK_SOFT, 'center', '0.34em', '600');
+
+  // stat columns — SCORE and BEST only, equal spacing
+  const cols = [['SCORE', String(nv)], ['BEST', String(highScore)]];
+  const colGap = Math.min(180, W * 0.26), n = cols.length;
+  const labelY = H * 0.51, valueY = H * 0.51 + 44, vSize = Math.min(40, W * 0.082);
+  for (let i = 0; i < n; i++) {
+    const colx = cx - colGap * (n - 1) / 2 + i * colGap;
+    label(cols[i][0], colx, labelY, 10, INK_SOFT, 'center', '0.28em', '500');
+    label(cols[i][1], colx, valueY, vSize, '#3f3a33', 'center', '0.02em', '700');
+  }
+
+  // actions — TAP TO TRY AGAIN is primary (full opacity); LEADERBOARD is the same
+  // size/weight but quieter (60%). Both flat, no boxes.
+  const rowY = H * 0.72, colW = Math.min(W * 0.82, 520), asz = Math.min(12, W * 0.026);
+  const m = Math.max(18, Math.min(W, H) * 0.05);
+  label('TAP TO TRY AGAIN', cx - colW / 2, rowY, asz, '#3f3a33', 'left', '0.28em', '600');
+  ctx.globalAlpha = a * 0.6;
+  label('LEADERBOARD', cx + colW / 2, rowY, asz, '#3f3a33', 'right', '0.28em', '600');
+  linkOverBoard = { x: cx + colW / 2 - 190, y: rowY - 24, w: 200, h: 44 };
+
+  // close × — top-right, same muted style, returns to the intro screen
+  linkOverClose = drawCloseX();
   ctx.globalAlpha = 1;
 }
 
@@ -883,12 +1263,81 @@ function drawWin(t) {
   ctx.globalAlpha = 1;
 }
 
+// ─── Non-interactive onboarding — illustrative scene behind each beat's text ─
+function drawOnboard(t) {
+  drawBg();
+  for (const s of shapes) drawOrb(s, 1, t);            // drifting blobs
+  for (const mo of motes) drawMote(mo, t);             // the dot
+  if (ringActive) {                                    // pulse wave demo
+    const k = ringT / 600, r = 300 * sstep(k);
+    ctx.strokeStyle = `rgba(244,176,86,${0.4 * (1 - k)})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(ringX, ringY, r, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  // beat text with fade in / hold / fade out
+  let txt, lt, hold;
+  if (obT < 2100)      { txt = 'COLLECT DOTS';           lt = obT;        hold = 1500; }
+  else if (obT < 4200) { txt = 'AVOID BLOBS';            lt = obT - 2100; hold = 1500; }
+  else if (obT < 6300) { txt = 'SPACE TO PULSE';         lt = obT - 4200; hold = 1500; }
+  else                 { txt = 'HOW LONG CAN YOU LAST?'; lt = obT - 6300; hold = 1200; }
+  const a = lt < 300 ? lt / 300 : lt < 300 + hold ? 1 : lt < 600 + hold ? 1 - (lt - 300 - hold) / 300 : 0;
+  ctx.globalAlpha = Math.max(0, Math.min(1, a));
+  label(txt, W / 2, H * 0.3, Math.min(32, W * 0.066), '#3f3a33', 'center', '0.34em', '700');
+  ctx.globalAlpha = 1;
+
+  drawGrain();
+}
+
+// ─── Leaderboard ─────────────────────────────────────────────────────────────
+function drawBoard(t) {
+  drawBg();
+  const m = Math.max(18, Math.min(W, H) * 0.05);
+  const tSize = Math.min(70, W * 0.135);
+  label('NERVE', W / 2, H * 0.14, tSize, '#3f3a33', 'center', '0.4em', '700');
+  label('TOP SCORES', W / 2, H * 0.14 + tSize * 0.6, Math.min(11, W * 0.024), INK_SOFT, 'center', '0.42em', '500');
+  drawCloseX();
+
+  if (boardRows === null) { label('LOADING…', W / 2, H * 0.5, 11, INK_SOFT, 'center', '0.3em', '500'); drawGrain(); return; }
+  if (!boardRows.length)  { label('NO SCORES YET', W / 2, H * 0.5, 11, INK_SOFT, 'center', '0.3em', '500'); drawGrain(); return; }
+
+  const colW = Math.min(W * 0.72, 460);
+  const lx = W / 2 - colW / 2, rx = W / 2 + colW / 2;
+  const rowH = Math.min(38, H * 0.055), top = H * 0.30;
+  // one row: current player at full opacity + bolder, everyone else at 50%
+  const drawRow = (rank, name, score, y, mine) => {
+    ctx.globalAlpha = mine ? 1 : 0.5;
+    label(String(rank).padStart(2, '0'), lx, y, 11, INK_SOFT, 'left', '0.1em', '600');
+    label((name || '—').toUpperCase(), lx + 46, y, 12, '#3f3a33', 'left', '0.16em', mine ? '700' : '500');
+    ctx.font = `${mine ? 700 : 600} 13px 'SF Mono', ui-monospace, Menlo, monospace`;
+    ctx.fillStyle = '#3f3a33'; ctx.textAlign = 'right'; ctx.letterSpacing = '0em';
+    ctx.fillText(String(score), rx, y);
+    ctx.globalAlpha = 1;
+  };
+  for (let i = 0; i < boardRows.length; i++) {
+    const row = boardRows[i];
+    const mine = playerName && row.name && row.name.toUpperCase() === playerName.toUpperCase();
+    drawRow(i + 1, row.name, row.score, top + i * rowH, mine);
+  }
+  // player not in top 10 → their row below a thin separator, with real rank
+  if (boardMe && boardMe.rank > 10) {
+    const sy = top + boardRows.length * rowH + rowH * 0.35;
+    ctx.globalAlpha = 0.35; ctx.fillStyle = 'rgba(124,118,108,0.5)';
+    ctx.fillRect(lx, sy, colW, 1); ctx.globalAlpha = 1;
+    drawRow(boardMe.rank, boardMe.name, boardMe.score, sy + rowH * 0.75, true);
+  }
+  label('TAP ANYWHERE TO CLOSE', W / 2, H * 0.93, 9, INK_FAINT, 'center', '0.28em', '500');
+  drawGrain();
+}
+
 // ─── Loop ──────────────────────────────────────────────────────────────────--
 function loop(t) {
   update(t);
   if      (state === 'intro')   drawIntro(t);
+  else if (state === 'onboard') drawOnboard(t);
   else if (state === 'playing') drawGame(t);
   else if (state === 'won')     drawWin(t);
+  else if (state === 'board')   drawBoard(t);
   else                          drawOver(t);
   requestAnimationFrame(loop);
 }
