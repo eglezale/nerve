@@ -898,7 +898,10 @@ function update(t) {
     const mo = motes[i];
     mo.life -= dt;
     if (Math.hypot(px - mo.x, py - mo.y) < 18) {       // collected (hover over it)
-      collected++;                                      // raises the (hidden) multiplier
+      const gained = Math.round(mult * 10);             // worth more as the (hidden) multiplier climbs
+      nerve += gained;
+      collected++;
+      addFloat(mo.x, mo.y, '+' + gained, 'rgba(199,154,58,A)', 16);
       motes.splice(i, 1); playMote();
     } else if (mo.life <= 0 || pointCovered(mo.x, mo.y)) {
       motes.splice(i, 1);                              // expired or swallowed by ink
