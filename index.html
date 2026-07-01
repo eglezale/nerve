@@ -214,7 +214,14 @@ let pulseUses = PULSE_USES, pulseActive = false, pulseElapsed = 0;
 // one-time "SPACE TO PULSE" hint on the first critical near-miss (persisted)
 let hintShown = !!localStorage.getItem('nerve_pulsehint'), hintStart = -9999;
 let ringActive = false, ringT = 0, ringX = 0, ringY = 0; // expanding wave visual
+let ringMax = 300, ringDur = 600, ringWidth = 2;         // sized per trigger (pulse vs power)
 const pulseIcons = [0, 1, 2].map(i => ({ pal: COOL[i % COOL.length], lobes: makeLobes(0.4), a: 1 }));
+
+// ── Special dots ─────────────────────────────────────────────────────────────
+// power-up: clears blobs (30s cadence, 10s life). bonus: +100 (≈20±8s, 8s life).
+let powerDot = null, powerTimer = 0;
+let bonusDot = null, bonusTimer = 0, bonusNext = 20000;
+const bursts = [];                                       // small diamond fragments (bonus collect)
 
 // intro screen — dots that fade in/out at random spots (world is already alive)
 let introDots = [], introNextSpawn = 0;
@@ -280,16 +287,29 @@ window.addEventListener('keydown', e => {
     if (state === 'playing') firePulse();
   }
 });
+function pushBlobsFrom(x, y, dist) {       // capture an outward push dir per blob
+  for (const s of shapes) {
+    const hx = s.homeX ?? s.x, hy = s.homeY ?? s.y;
+    let dx = hx - x, dy = hy - y, d = Math.hypot(dx, dy) || 1;
+    s.pushDX = dx / d * dist; s.pushDY = dy / d * dist;
+  }
+}
 function firePulse() {
   if (pulseUses <= 0) return;
   pulseUses--;
   playPulse();
   pulseActive = true; pulseElapsed = 0;
-  ringActive = true; ringT = 0; ringX = px; ringY = py;
-  for (const s of shapes) {                 // capture an outward push dir per blob
-    const hx = s.homeX ?? s.x, hy = s.homeY ?? s.y;
-    let dx = hx - px, dy = hy - py, d = Math.hypot(dx, dy) || 1;
-    s.pushDX = dx / d * PULSE_MAX; s.pushDY = dy / d * PULSE_MAX;
+  ringActive = true; ringT = 0; ringX = px; ringY = py; ringMax = 300; ringDur = 600; ringWidth = 2;
+  pushBlobsFrom(px, py, PULSE_MAX);
+}
+// power-up collection: flag every blob within 40% of screen width of the player.
+// They fade out as the expanding ring reaches them (distance-based), no scaling.
+function clearBlobsNearPlayer() {
+  const R = 0.4 * W;
+  for (const s of shapes) {
+    if (s.dying) continue;
+    const dist = Math.hypot(s.x - px, s.y - py);
+    if (dist <= R) { s.dying = true; s.fadeDist = dist; s.fadeT = -1; }
   }
 }
 
@@ -340,8 +360,8 @@ function updateOnboard(dt, t) {
   const cx = W / 2, cy = H / 2;
   const breathe = s => { const pf = Math.sin(t * s.pulseFreq + s.pulsePhase); s.drawW = s.w * (1 + pf * s.pulseAmp); s.drawH = s.h * (1 + pf * s.pulseAmp); };
   if (obT >= 2100 && !obBlobsSpawned) { obBlobsSpawned = true; spawnObBlobs(); }
-  if (obT >= 4200 && !obPulsed) { obPulsed = true; ringActive = true; ringT = 0; ringX = cx; ringY = cy; }
-  if (ringActive) { ringT += dt; if (ringT > 600) ringActive = false; }
+  if (obT >= 4200 && !obPulsed) { obPulsed = true; ringActive = true; ringT = 0; ringX = cx; ringY = cy; ringMax = 300; ringDur = 600; ringWidth = 2; }
+  if (ringActive) { ringT += dt; if (ringT > ringDur) ringActive = false; }
   for (const s of shapes) {
     if (obT < 4200) {                                  // drift toward the dot
       const k = Math.min(1, dt * 0.0007);
@@ -508,6 +528,32 @@ function playHighScore() {
   o.start(t0); o.stop(t0 + 0.62);
 }
 
+// POWER-UP collect — a soft "fwump" (short white-noise burst) then a clean sine.
+function playPowerCollect() {
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  // white-noise burst, ~80ms, quick fade — soft impact
+  const len = Math.floor(audioCtx.sampleRate * 0.08);
+  const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource(); src.buffer = buf;
+  const ng = audioCtx.createGain();
+  ng.gain.setValueAtTime(0.25, t0);
+  ng.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
+  src.connect(ng); ng.connect(audioCtx.destination);
+  src.start(t0); src.stop(t0 + 0.08);
+  // clean sine, 330Hz, attack 10ms → release to 400ms
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = 'sine'; o.frequency.value = 330;
+  const st = t0 + 0.05;
+  g.gain.setValueAtTime(0.0001, st);
+  g.gain.linearRampToValueAtTime(0.2, st + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, st + 0.4);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(st); o.stop(st + 0.42);
+}
+
 // PULSE activation — light and airy: a soft high shimmer that swells outward and
 // fades. Gentle upward lift (opening, not bouncing), pure sines, no resonance.
 function playPulse() {
@@ -621,6 +667,7 @@ function spawnUnderCursor() {
 function gapAt(x, y) {
   let g = Infinity;
   for (const s of shapes) {
+    if (s.dying) continue;
     const lr = ((s.drawW || s.w) + (s.drawH || s.h)) / 2 * 0.44;
     const d = Math.hypot(x - s.x, y - s.y) - lr;
     if (d < g) g = d;
@@ -646,6 +693,33 @@ function spawnMote() {
       moteSpawnCount++;
       return;
     }
+  }
+}
+
+// a spot away from the player and out of the ink, for special dots
+function specialSpawnPos() {
+  for (let i = 0; i < 24; i++) {
+    const x = 60 + Math.random() * (W - 120), y = 60 + Math.random() * (H - 120);
+    if (Math.hypot(x - px, y - py) > 130 && !pointCovered(x, y)) return { x, y };
+  }
+  return { x: W / 2, y: H / 2 };
+}
+function spawnPowerDot() { const p = specialSpawnPos(); powerDot = { x: p.x, y: p.y, life: 5200 }; } // matches regular dot
+function spawnBonusDot() { const p = specialSpawnPos(); bonusDot = { x: p.x, y: p.y, life: 8000 }; }
+// small diamond fragments flung outward when a bonus dot is collected
+function spawnBurst(x, y, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU, sp = 0.06 + Math.random() * 0.1;
+    bursts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 450, maxLife: 450 });
+  }
+}
+function drawBursts() {
+  for (const b of bursts) {
+    const a = Math.max(0, b.life / b.maxLife), r = 4 * a + 1;
+    ctx.fillStyle = `rgba(244,176,86,${0.85 * a})`;
+    ctx.save(); ctx.translate(b.x, b.y);
+    ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath(); ctx.fill();
+    ctx.restore();
   }
 }
 
@@ -712,6 +786,9 @@ function startGame() {
   runStartBest = highScore; hiTriggered = false; hiPulseStart = -9999;
   pulseUses = PULSE_USES; pulseActive = false; pulseElapsed = 0; ringActive = false;
   pulseIcons.forEach(ic => ic.a = 1);
+  powerDot = null; powerTimer = 15000; bonusDot = null; bonusTimer = 0; // first power-up at 15s
+  bonusNext = 20000 + (Math.random() * 16000 - 8000);
+  bursts.length = 0;
   motes.length = 0; moteTimer = 0; collected = 0; moteSpawnCount = 0; reachTimer = 0;
   floats.length = 0;
   spawnTimer = -300; ambushTimer = 0; nextSpawn = 600;
@@ -729,6 +806,7 @@ function startGame() {
 // (~88% of the visual radius, so the soft rim stays forgiving).
 function pointCovered(x, y) {
   for (const s of shapes) {
+    if (s.dying) continue;                            // vanishing blobs are harmless
     const ex = (x - s.x) / ((s.drawW || s.w) * 0.44 + 0.001);
     const ey = (y - s.y) / ((s.drawH || s.h) * 0.44 + 0.001);
     if (ex*ex + ey*ey <= 1) return true;
@@ -750,7 +828,7 @@ function measureOccupancy() {
 }
 
 // ─── Game over ─────────────────────────────────────────────────────────────--
-let overAlpha = 0, deathX = 0, deathY = 0, deathPal = COOL[0], deathLobes = makeLobes();
+let overAlpha = 0, overT = 0, deathX = 0, deathY = 0, deathPal = COOL[0], deathLobes = makeLobes();
 function triggerGameOver() {
   state = 'over';
   deathX = px; deathY = py;
@@ -759,7 +837,7 @@ function triggerGameOver() {
     const ey = (py - s.y) / ((s.drawH || s.h) * 0.5 + 0.001);
     if (ex*ex + ey*ey <= 1) { deathPal = s.pal; deathLobes = s.lobes; break; }
   }
-  overAlpha = 0;
+  overAlpha = 0; overT = 0;
   const finalScore = Math.round(nerve);
   saveBest();
   // submit if we know who you are; otherwise ask for a name — only after the
@@ -784,6 +862,32 @@ function triggerWin() {
   playWin();
 }
 
+// After death the canvas stays live — blobs keep spawning & growing (no player,
+// no scoring, no death). The stats simply fade in over the top.
+function updateOver(dt, t) {
+  overT += dt;
+  const d = difficulty();
+  spawnTimer += dt;
+  if (spawnTimer >= nextSpawn) {
+    spawnTimer = 0;
+    nextSpawn = d.spawnInterval * (0.4 + Math.random() * 1.3);
+    spawnShape();
+    if (Math.random() < d.burst) { spawnShape(); if (Math.random() < 0.4) spawnShape(); }
+  }
+  for (const s of shapes) {
+    if (s.dying) continue;
+    if (s.growing) {
+      const rate = d.shapeSpeed * dt;
+      s.w = Math.min(s.maxW, s.w + rate * (s.maxW / 180));
+      s.h = Math.min(s.maxH, s.h + rate * (s.maxH / 180));
+      if (s.w >= s.maxW && s.h >= s.maxH) s.growing = false;
+    }
+    const pf = Math.sin(t * s.pulseFreq + s.pulsePhase);
+    s.drawW = s.w * (1 + pf * s.pulseAmp);
+    s.drawH = s.h * (1 + pf * s.pulseAmp);
+  }
+}
+
 // ─── Update ────────────────────────────────────────────────────────────────--
 let lastT = 0;
 function update(t) {
@@ -791,6 +895,7 @@ function update(t) {
   lastT = t;
   pulse += dt * 0.004;
   if (state === 'onboard') { updateOnboard(dt, t); return; }
+  if (state === 'over') { updateOver(dt, t); return; }
   if (state !== 'playing') return;
 
   elapsed += dt;
@@ -830,7 +935,22 @@ function update(t) {
     if (Math.random() < d.ambushChance) { spawnAmbush(); playAmbush(); }
   }
 
-  for (const s of shapes) {
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    const s = shapes[i];
+    if (s.dying) {                                    // power-up: fade as the ring reaches it
+      const pf0 = Math.sin(t * s.pulseFreq + s.pulsePhase);
+      s.drawW = s.w * (1 + pf0 * s.pulseAmp); s.drawH = s.h * (1 + pf0 * s.pulseAmp); // no scale-up
+      if (s.fadeT < 0) {                              // waiting for the ring to arrive
+        const reach = ringActive ? ringMax * sstep(ringT / ringDur) : Infinity;
+        if (reach >= s.fadeDist) s.fadeT = 0;
+        s.dieAlpha = 1;
+      } else {
+        s.fadeT += dt;
+        if (s.fadeT >= 200) { shapes.splice(i, 1); continue; }
+        s.dieAlpha = 1 - s.fadeT / 200;               // clean opacity fade over 200ms
+      }
+      continue;
+    }
     if (s.growing) {
       const rate = d.shapeSpeed * dt;
       s.w = Math.min(s.maxW, s.w + rate * (s.maxW / 180));
@@ -843,7 +963,7 @@ function update(t) {
   }
 
   // ── PULSE: displace blobs outward, hold ~3s, then drift home (amt eases to 0) ──
-  if (ringActive) { ringT += dt; if (ringT > 600) ringActive = false; }
+  if (ringActive) { ringT += dt; if (ringT > ringDur) ringActive = false; }
   // icons fade: the used ones ease down toward ~18% opacity
   const used = PULSE_USES - pulseUses;
   for (let i = 0; i < pulseIcons.length; i++) {
@@ -908,11 +1028,42 @@ function update(t) {
     }
   }
 
+  // ── Power-up dot: every 30s, same lifespan as a regular dot; on collect it
+  //    cleanly removes blobs within 40% of screen width of the player ──
+  if (powerDot) {
+    powerDot.life -= dt;
+    if (Math.hypot(px - powerDot.x, py - powerDot.y) < 24) {
+      clearBlobsNearPlayer();
+      ringActive = true; ringT = 0; ringX = px; ringY = py;
+      ringMax = Math.hypot(W, H); ringDur = 600; ringWidth = 3; // ring sweeps full screen
+      playPowerCollect();
+      powerDot = null; powerTimer = 0;
+    } else if (powerDot.life <= 0 || pointCovered(powerDot.x, powerDot.y)) { powerDot = null; powerTimer = 0; }
+  } else { powerTimer += dt; if (powerTimer >= 30000) spawnPowerDot(); }
+
+  // ── Bonus dot: ~20±8s, lives 8s; on collect a flat +100 (no multiplier) ──
+  if (bonusDot) {
+    bonusDot.life -= dt;
+    if (Math.hypot(px - bonusDot.x, py - bonusDot.y) < 20) {
+      nerve += 100;
+      addFloat(bonusDot.x, bonusDot.y, '+100', 'rgba(199,154,58,A)', 20);
+      spawnBurst(bonusDot.x, bonusDot.y, 7);           // diamond fragments
+      hiPulseStart = elapsed;                          // brief score flash
+      bonusDot = null; bonusTimer = 0; bonusNext = 20000 + (Math.random() * 16000 - 8000);
+    } else if (bonusDot.life <= 0) { bonusDot = null; bonusTimer = 0; bonusNext = 20000 + (Math.random() * 16000 - 8000); }
+  } else { bonusTimer += dt; if (bonusTimer >= bonusNext) spawnBonusDot(); }
+
   // rising score popups
   for (let i = floats.length - 1; i >= 0; i--) {
     const f = floats[i];
     f.life -= dt; f.y -= dt * 0.022;
     if (f.life <= 0) floats.splice(i, 1);
+  }
+  // diamond-fragment bursts
+  for (let i = bursts.length - 1; i >= 0; i--) {
+    const b = bursts[i];
+    b.x += b.vx * dt; b.y += b.vy * dt; b.vx *= 0.94; b.vy *= 0.94; b.life -= dt;
+    if (b.life <= 0) bursts.splice(i, 1);
   }
 
   // run ends when the ink consumes you
@@ -1083,6 +1234,56 @@ function drawMote(mo, t) {
   }
 }
 
+// POWER-UP dot — regular-size gold centre wrapped in two concentric rings that
+// pulse slowly (expand + fade) on staggered timing. Larger footprint, same core.
+function drawPowerDot(d, t) {
+  const fade = Math.min(1, d.life / 900);
+  // two pulsing rings first (behind the centre)
+  const ring = (baseR, maxOp, off) => {
+    const p = ((t + off) % 1800) / 1800;                // slow cycle
+    const rr = baseR * (1 + 0.25 * p);
+    const op = maxOp * (1 - p) * fade;
+    ctx.strokeStyle = `rgba(244,176,86,${op})`;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(d.x, d.y, rr, 0, Math.PI * 2); ctx.stroke();
+  };
+  ring(24, 0.35, 0);                                    // inner, closer, brighter
+  ring(38, 0.20, 900);                                  // outer, further, fainter, staggered
+  // centre dot — identical to a regular collectible dot
+  const R = 17;
+  const g = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, R);
+  g.addColorStop(0,   `rgba(255,206,110,${0.95 * fade})`);
+  g.addColorStop(0.5, `rgba(244,176,86,${0.40 * fade})`);
+  g.addColorStop(1,   'rgba(244,176,86,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(d.x, d.y, R, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = `rgba(80,60,30,${0.6 * fade})`;
+  ctx.beginPath(); ctx.arc(d.x, d.y, 1.7, 0, Math.PI * 2); ctx.fill();
+}
+
+// BONUS dot — muted-teal double diamond with a slow pulsing glow.
+function drawBonusDot(d, t) {
+  const fade = Math.min(1, d.life / 900);
+  const teal = '139,191,191';                            // soft mint, muted
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  // slow glow pulse — same 1800ms rhythm as the power-up rings, teal tone
+  const p = (t % 1800) / 1800;
+  const gr = 22 * (1 + 0.25 * p), gop = 0.4 * (1 - p) * fade;
+  const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, gr);
+  glow.addColorStop(0, `rgba(${teal},${gop})`);
+  glow.addColorStop(1, `rgba(${teal},0)`);
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(0, 0, gr, 0, Math.PI * 2); ctx.fill();
+  const RO = 19;                                         // slightly larger than a regular dot
+  ctx.strokeStyle = `rgba(${teal},${0.85 * fade})`; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(0, -RO); ctx.lineTo(RO, 0); ctx.lineTo(0, RO); ctx.lineTo(-RO, 0); ctx.closePath(); ctx.stroke();
+  const RI = 6.5;
+  ctx.fillStyle = `rgba(${teal},${0.9 * fade})`;
+  ctx.beginPath(); ctx.moveTo(0, -RI); ctx.lineTo(RI, 0); ctx.lineTo(0, RI); ctx.lineTo(-RI, 0); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
 // Rising "+NERVE" popups.
 function drawFloats() {
   ctx.textAlign = 'center';
@@ -1105,8 +1306,11 @@ function drawCloseX() {
 
 function drawGame(t) {
   drawBg();
-  for (const s of shapes) drawOrb(s, 1, t);
+  for (const s of shapes) drawOrb(s, s.dying ? s.dieAlpha : 1, t);
   for (const mo of motes) drawMote(mo, t);
+  if (powerDot) drawPowerDot(powerDot, t);
+  if (bonusDot) drawBonusDot(bonusDot, t);
+  drawBursts();
 
   // camp warning — a tightening ring forms under a lingering player before ink does
   if (campTime > CAMP_FULL - CAMP_WARN) {
@@ -1120,9 +1324,9 @@ function drawGame(t) {
 
   // pulse wave — one clean expanding ring, warm gold like the collectible dots
   if (ringActive) {
-    const k = ringT / 600, r = 300 * sstep(k);
+    const k = ringT / ringDur, r = ringMax * sstep(k);
     ctx.strokeStyle = `rgba(244,176,86,${0.4 * (1 - k)})`;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = ringWidth;
     ctx.beginPath(); ctx.arc(ringX, ringY, r, 0, Math.PI * 2); ctx.stroke();
   }
 
@@ -1173,67 +1377,100 @@ function drawGame(t) {
 }
 
 function drawOver(t) {
-  // frozen scene
+  // canvas stays LIVE — blobs keep moving, but drop to 30% opacity on the death screen
   drawBg();
-  for (const s of shapes) drawOrb(s, 1, t);
-
-  // warm veil settles over the scene
-  overAlpha = Math.min(1, overAlpha + 0.018);
-  ctx.fillStyle = `rgba(241,237,230,${overAlpha * 0.86})`;
+  for (const s of shapes) drawOrb(s, (s.dying ? s.dieAlpha : 1) * 0.3, t);
+  drawBursts();
+  // white overlay dims the blobs — drawn BEFORE grain so the paper texture stays
+  ctx.fillStyle = `rgba(255,255,255,${Math.min(1, overT / 500) * 0.38})`;
   ctx.fillRect(0, 0, W, H);
-
-  // a final bloom where the player was consumed
-  if (overAlpha < 0.9) {
-    const bloomR = overAlpha * Math.max(W, H) * 0.18;
-    drawOrb({ x: deathX, y: deathY, drawW: bloomR * 2, drawH: bloomR * 2,
-              pal: deathPal, lobes: deathLobes }, (1 - overAlpha) * 0.9, t);
-  }
-
   drawGrain();
-  if (overAlpha < 0.35) return;
-  const a = Math.min(1, (overAlpha - 0.35) / 0.4);
-  ctx.globalAlpha = a;
 
-  // Permanent, clean death screen — name capture is a separate modal on top.
-  const nv = Math.round(nerve), cx = W / 2;
-  const newBest = runStartBest > 0 && nv > runStartBest;   // beat a real prior best
-  ctx.globalAlpha = a;
+  const cx = W / 2, nv = Math.round(nerve);
 
-  label('CAUGHT', cx, H * 0.24, Math.min(49, W * 0.103), '#3f3a33', 'center', '0.32em', '700');
-
-  // while the floating name prompt is up, it owns the centre. Show CAUGHT, and —
-  // only if this run beat the previous best — a NEW BEST block above the prompt.
+  // name capture (first game) owns the centre — just CAUGHT (+ its NEW BEST block)
   if (namePrompt) {
-    linkOverBoard = linkOverClose = null;
+    ctx.globalAlpha = Math.min(1, overT / 400);
+    label('CAUGHT', cx, H * 0.24, Math.min(49, W * 0.103), '#3f3a33', 'center', '0.32em', '700');
     if (nv > runStartBest) {
       label('NEW BEST', cx, H * 0.34, 10, INK_SOFT, 'center', '0.34em', '600');
       label(String(nv), cx, H * 0.34 + 46, Math.min(42, W * 0.09), '#3f3a33', 'center', '0.02em', '700');
     }
-    ctx.globalAlpha = 1; return;
+    ctx.globalAlpha = 1; linkOverBoard = linkOverClose = null; return;
   }
 
-  if (newBest) label('NEW BEST', cx, H * 0.45, 10, INK_SOFT, 'center', '0.34em', '600');
-
-  // stat columns — SCORE and BEST only, equal spacing
-  const cols = [['SCORE', String(nv)], ['BEST', String(highScore)]];
-  const colGap = Math.min(180, W * 0.26), n = cols.length;
-  const labelY = H * 0.51, valueY = H * 0.51 + 44, vSize = Math.min(40, W * 0.082);
-  for (let i = 0; i < n; i++) {
-    const colx = cx - colGap * (n - 1) / 2 + i * colGap;
-    label(cols[i][0], colx, labelY, 10, INK_SOFT, 'center', '0.28em', '500');
-    label(cols[i][1], colx, valueY, vSize, '#3f3a33', 'center', '0.02em', '700');
+  // ── New high-score celebration — quiet, sequential acknowledgment ──
+  if (nv > runStartBest) {
+    const y0 = H * 0.44, vSize = Math.min(36, W * 0.075), bestSize = vSize * 0.7;
+    // CAUGHT fades in first (NEW BEST now lives on the BEST label, not up here)
+    ctx.globalAlpha = Math.min(1, overT / 300);
+    label('CAUGHT', cx, H * 0.28, Math.min(49, W * 0.103), '#3f3a33', 'center', '0.32em', '700');
+    // SCORE counts up from 0 (+300ms after CAUGHT), 1200ms ease-in-out — hero number
+    const cuStart = 600, cuDur = 1200;
+    const blockA = Math.max(0, Math.min(1, (overT - cuStart) / 300));
+    const cuP = Math.max(0, Math.min(1, (overT - cuStart) / cuDur));
+    ctx.globalAlpha = blockA;
+    label('SCORE', cx, y0, 10, INK_SOFT, 'center', '0.3em', '500');
+    label(String(Math.round(sstep(cuP) * nv)), cx, y0 + 34, vSize, '#3f3a33', 'center', '0.02em', '700');
+    ctx.globalAlpha = blockA * 0.5;                       // NEW BEST label more muted
+    label('NEW BEST', cx, y0 + 92, 10, INK_SOFT, 'center', '0.3em', '500');
+    // BEST bounce + swap old→new when the count-up finishes (smaller number)
+    const bt = overT - (cuStart + cuDur);      // ms since count-up ended (1800ms)
+    const bestNum = (txt, scale, alpha) => {
+      ctx.globalAlpha = alpha;
+      ctx.save(); ctx.translate(cx, y0 + 122); ctx.scale(scale, scale);
+      ctx.font = `700 ${bestSize}px 'Helvetica Neue', Helvetica, Arial, sans-serif`;
+      ctx.fillStyle = '#3f3a33'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'; ctx.letterSpacing = '0.02em';
+      ctx.fillText(txt, 0, 0); ctx.letterSpacing = '0em'; ctx.restore();
+    };
+    if (bt < 0)        bestNum(String(runStartBest), 1, blockA);                   // previous best, holding
+    else if (bt < 150) bestNum(String(runStartBest), 1 + 0.15 * (bt / 150), 1);    // old scales up ~115%
+    else if (bt < 250) bestNum(String(runStartBest), 1.15, 1 - (bt - 150) / 100);  // old fades out
+    else bestNum(String(nv), 1.10 - 0.10 * sstep(Math.min(1, (bt - 250) / 300)),   // new fades in + settles
+                 Math.min(1, (bt - 250) / 200));
+    // actions fade in 300ms after BEST settles (≈2650ms); TRY AGAIN pulses
+    const actA = Math.max(0, Math.min(1, (overT - 2650) / 400));
+    const ay = H * 0.74, asz = Math.min(12, W * 0.026);
+    ctx.globalAlpha = actA * (0.75 + 0.25 * Math.sin(t * Math.PI / 1000));
+    label('TRY AGAIN', cx, ay, asz, '#3f3a33', 'center', '0.3em', '600');
+    const boardY = H - 32;
+    ctx.globalAlpha = actA * 0.6;
+    label('LEADERBOARD', cx, boardY, asz, '#3f3a33', 'center', '0.3em', '600');
+    linkOverBoard = { x: cx - 120, y: boardY - 24, w: 240, h: 40 };
+    ctx.globalAlpha = actA;
+    linkOverClose = drawCloseX();
+    ctx.globalAlpha = 1;
+    return;
   }
 
-  // actions — TAP TO TRY AGAIN is primary (full opacity); LEADERBOARD is the same
-  // size/weight but quieter (60%). Both flat, no boxes.
-  const rowY = H * 0.72, colW = Math.min(W * 0.82, 520), asz = Math.min(12, W * 0.026);
-  const m = Math.max(18, Math.min(W, H) * 0.05);
-  label('TAP TO TRY AGAIN', cx - colW / 2, rowY, asz, '#3f3a33', 'left', '0.28em', '600');
-  ctx.globalAlpha = a * 0.6;
-  label('LEADERBOARD', cx + colW / 2, rowY, asz, '#3f3a33', 'right', '0.28em', '600');
-  linkOverBoard = { x: cx + colW / 2 - 190, y: rowY - 24, w: 200, h: 44 };
+  // staggered fade-in: CAUGHT → SCORE/BEST stack (+300ms) → actions (+600ms)
+  const caughtA = Math.min(1, overT / 400);
+  const scoreA  = Math.max(0, Math.min(1, (overT - 300) / 400));
+  const actA    = Math.max(0, Math.min(1, (overT - 600) / 400));
 
-  // close × — top-right, same muted style, returns to the intro screen
+  ctx.globalAlpha = caughtA;
+  label('CAUGHT', cx, H * 0.28, Math.min(49, W * 0.103), '#3f3a33', 'center', '0.32em', '700');
+
+  // SCORE (hero) / number / BEST / smaller number — centered vertical stack
+  const y0 = H * 0.44, vSize = Math.min(36, W * 0.075), bestSize = vSize * 0.7;
+  ctx.globalAlpha = scoreA;
+  label('SCORE', cx, y0, 10, INK_SOFT, 'center', '0.3em', '500');
+  label(String(nv), cx, y0 + 34, vSize, '#3f3a33', 'center', '0.02em', '700');
+  ctx.globalAlpha = scoreA * 0.5;                        // BEST label more muted
+  label('BEST', cx, y0 + 92, 10, INK_SOFT, 'center', '0.3em', '500');
+  ctx.globalAlpha = scoreA;
+  label(String(highScore), cx, y0 + 122, bestSize, '#3f3a33', 'center', '0.02em', '700');
+
+  // TRY AGAIN — centered, slow opacity pulse; LEADERBOARD pinned to bottom (32px)
+  const ay = H * 0.74, asz = Math.min(12, W * 0.026);
+  ctx.globalAlpha = actA * (0.75 + 0.25 * Math.sin(t * Math.PI / 1000));
+  label('TRY AGAIN', cx, ay, asz, '#3f3a33', 'center', '0.3em', '600');
+  const boardY = H - 32;
+  ctx.globalAlpha = actA * 0.6;
+  label('LEADERBOARD', cx, boardY, asz, '#3f3a33', 'center', '0.3em', '600');
+  linkOverBoard = { x: cx - 120, y: boardY - 24, w: 240, h: 40 };
+
+  ctx.globalAlpha = actA;
   linkOverClose = drawCloseX();
   ctx.globalAlpha = 1;
 }
@@ -1271,9 +1508,9 @@ function drawOnboard(t) {
   for (const s of shapes) drawOrb(s, 1, t);            // drifting blobs
   for (const mo of motes) drawMote(mo, t);             // the dot
   if (ringActive) {                                    // pulse wave demo
-    const k = ringT / 600, r = 300 * sstep(k);
+    const k = ringT / ringDur, r = ringMax * sstep(k);
     ctx.strokeStyle = `rgba(244,176,86,${0.4 * (1 - k)})`;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = ringWidth;
     ctx.beginPath(); ctx.arc(ringX, ringY, r, 0, Math.PI * 2); ctx.stroke();
   }
 
