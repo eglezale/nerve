@@ -898,8 +898,7 @@ function update(t) {
     const mo = motes[i];
     mo.life -= dt;
     if (Math.hypot(px - mo.x, py - mo.y) < 18) {       // collected (hover over it)
-      collected++;                                      // raises the multiplier (+0.1)
-      addFloat(mo.x, mo.y, '+0.1×', 'rgba(199,154,58,A)', 15);
+      collected++;                                      // raises the (hidden) multiplier
       motes.splice(i, 1); playMote();
     } else if (mo.life <= 0 || pointCovered(mo.x, mo.y)) {
       motes.splice(i, 1);                              // expired or swallowed by ink
